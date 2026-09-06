@@ -1,0 +1,6 @@
+{
+  "emit_objects": true,
+  "external_headers": ["market.h"],
+  "dsl_libraries": ["pricing.dsl.h"],
+  "context_functions": ["get_bid", "get_ask"]
+}

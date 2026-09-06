@@ -1,0 +1,13 @@
+DSL compiler 0.1.0
+LLVM/Clang release: @LLVM_PACKAGE_VERSION@
+LLVM CMake package: @LLVM_DIR@
+Clang headers: @DSL_CLANG_INCLUDE_DIR@
+Clang shared library: @DSL_CLANG_CPP_LIBRARY@
+Host C++ compiler: @CMAKE_CXX_COMPILER@
+Host C++ compiler version: @CMAKE_CXX_COMPILER_VERSION@
+Host C++ standard: C++@CMAKE_CXX_STANDARD@
+DSL input and generated C++ standard: C++23
+Runtime public headers: @CMAKE_CURRENT_SOURCE_DIR@/runtime/include
+Runtime target: dsl_runtime (static library)
+Runtime operation contract: dsl_runtime/operation.h (C++23 header)
+Code generation modes: scalar C++ source, function-object C++ header
