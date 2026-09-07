@@ -27,47 +27,68 @@ if(NOT DSL_HAS_CXX23_LIBRARY)
         "Select a matching compiler/standard library; this project was tested with GCC/libstdc++ 16.1.0.")
 endif()
 
-# Keep the AST API and the linked ABI on one reproducible release.
-set(DSL_LLVM_VERSION "20.1.8")
-find_package(LLVM ${DSL_LLVM_VERSION} EXACT REQUIRED CONFIG
-    HINTS /usr/lib/llvm-20/lib/cmake/llvm)
-find_path(DSL_CLANG_INCLUDE_DIR clang/Tooling/Tooling.h
-    HINTS ${LLVM_INCLUDE_DIRS} REQUIRED)
-find_library(DSL_CLANG_CPP_LIBRARY
-    NAMES clang-cpp libclang-cpp.so.20.1
-    HINTS ${LLVM_LIBRARY_DIRS} REQUIRED)
-file(STRINGS "${DSL_CLANG_INCLUDE_DIR}/clang/Basic/Version.inc" clang_version_line
-    REGEX "^#define CLANG_VERSION_STRING ")
-if(NOT clang_version_line STREQUAL "#define CLANG_VERSION_STRING \"${DSL_LLVM_VERSION}\"")
-    message(FATAL_ERROR "Clang headers must be ${DSL_LLVM_VERSION}: ${clang_version_line}")
-endif()
-message(STATUS "DSL LLVM/Clang version: ${LLVM_PACKAGE_VERSION}")
-message(STATUS "Clang headers: ${DSL_CLANG_INCLUDE_DIR}")
-message(STATUS "Clang library: ${DSL_CLANG_CPP_LIBRARY}")
+option(DSL_BUILD_COMPILER "Build the Clang DSL frontend and CLI" ON)
 
-add_subdirectory(runtime)
-configure_file(cmake/build-info.txt.in build-info.txt @ONLY)
-add_executable(dslc src/main.cpp src/frontend.cpp src/ir.cpp src/codegen.cpp src/objects.cpp src/config.cpp)
-target_include_directories(dslc PRIVATE include)
-target_include_directories(dslc SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${DSL_CLANG_INCLUDE_DIR})
-target_compile_definitions(dslc PRIVATE DSL_LLVM_VERSION="${DSL_LLVM_VERSION}"
-    DSL_RUNTIME_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
-target_compile_options(dslc PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(dslc PRIVATE ${DSL_CLANG_CPP_LIBRARY} LLVM)
+# Public IR and the C++ backend do not link or include LLVM/Clang.
+add_library(dsl_ir STATIC src/ir.cpp src/registry.cpp src/verify.cpp)
+target_include_directories(dsl_ir PUBLIC include)
+target_compile_options(dsl_ir PRIVATE -Wall -Wextra -Wpedantic)
+add_library(dsl_cpp_backend STATIC src/codegen.cpp)
+target_link_libraries(dsl_cpp_backend PUBLIC dsl_ir)
+target_compile_options(dsl_cpp_backend PRIVATE -Wall -Wextra -Wpedantic)
+
+if(DSL_BUILD_COMPILER)
+    # Keep the AST API and the linked ABI on one reproducible release.
+    set(DSL_LLVM_VERSION "20.1.8")
+    find_package(LLVM ${DSL_LLVM_VERSION} EXACT REQUIRED CONFIG
+        HINTS /usr/lib/llvm-20/lib/cmake/llvm)
+    find_path(DSL_CLANG_INCLUDE_DIR clang/Tooling/Tooling.h
+        HINTS ${LLVM_INCLUDE_DIRS} REQUIRED)
+    find_library(DSL_CLANG_CPP_LIBRARY
+        NAMES clang-cpp libclang-cpp.so.20.1
+        HINTS ${LLVM_LIBRARY_DIRS} REQUIRED)
+    file(STRINGS "${DSL_CLANG_INCLUDE_DIR}/clang/Basic/Version.inc" clang_version_line
+        REGEX "^#define CLANG_VERSION_STRING ")
+    if(NOT clang_version_line STREQUAL "#define CLANG_VERSION_STRING \"${DSL_LLVM_VERSION}\"")
+        message(FATAL_ERROR "Clang headers must be ${DSL_LLVM_VERSION}: ${clang_version_line}")
+    endif()
+    message(STATUS "DSL LLVM/Clang version: ${LLVM_PACKAGE_VERSION}")
+    message(STATUS "Clang headers: ${DSL_CLANG_INCLUDE_DIR}")
+    message(STATUS "Clang library: ${DSL_CLANG_CPP_LIBRARY}")
+
+    add_subdirectory(runtime)
+    configure_file(cmake/build-info.txt.in build-info.txt @ONLY)
+    add_executable(dslc src/main.cpp src/frontend.cpp src/frontend_ops.cpp
+        src/frontend_bindings.cpp src/semantic.cpp src/config.cpp)
+    target_include_directories(dslc PRIVATE include)
+    target_include_directories(dslc SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${DSL_CLANG_INCLUDE_DIR})
+    target_compile_definitions(dslc PRIVATE DSL_LLVM_VERSION="${DSL_LLVM_VERSION}"
+        DSL_RUNTIME_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
+    target_compile_options(dslc PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(dslc PRIVATE dsl_cpp_backend ${DSL_CLANG_CPP_LIBRARY} LLVM)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    add_test(NAME compiler_integration
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py
-            --dslc $<TARGET_FILE:dslc> --cxx ${CMAKE_CXX_COMPILER}
-            --examples ${CMAKE_CURRENT_SOURCE_DIR}/examples
-            --runtime-include ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
-            --runtime-library $<TARGET_FILE:dsl_runtime>)
-    add_test(NAME object_integration
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/objects.py
-            --examples ${CMAKE_CURRENT_SOURCE_DIR}/examples
-            --dslc $<TARGET_FILE:dslc> --cxx ${CMAKE_CXX_COMPILER}
-            --runtime-include ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
-            --runtime-library $<TARGET_FILE:dsl_runtime>)
+    add_executable(ir_verifier_tests tests/ir_verifier.cpp)
+    target_link_libraries(ir_verifier_tests PRIVATE dsl_ir)
+    add_test(NAME ir_verifier COMMAND ir_verifier_tests)
+    add_executable(backend_tests tests/backend.cpp)
+    target_link_libraries(backend_tests PRIVATE dsl_cpp_backend)
+    add_test(NAME backend_boundary COMMAND backend_tests)
+    if(DSL_BUILD_COMPILER)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME compiler_integration
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py
+                --dslc $<TARGET_FILE:dslc> --cxx ${CMAKE_CXX_COMPILER}
+                --examples ${CMAKE_CURRENT_SOURCE_DIR}/examples
+                --runtime-include ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
+                --runtime-library $<TARGET_FILE:dsl_runtime>)
+        add_test(NAME object_integration
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/objects.py
+                --examples ${CMAKE_CURRENT_SOURCE_DIR}/examples
+                --dslc $<TARGET_FILE:dslc> --cxx ${CMAKE_CXX_COMPILER}
+                --runtime-include ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
+                --runtime-library $<TARGET_FILE:dsl_runtime>)
+    endif()
 endif()

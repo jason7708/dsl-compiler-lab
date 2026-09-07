@@ -1,8 +1,7 @@
 #pragma once
-
-#include "dsl/ir.h"
-#include <string>
-
-namespace dsl {
-[[nodiscard]] std::string generateCpp(const Module &module);
-} // namespace dsl
+#include "dsl/program.h"
+#include <expected>
+namespace dsl::cpp {
+// Verifies core IR and C++/host integration compatibility before emission.
+[[nodiscard]] std::expected<std::string, std::string> generate(const Program &);
+} // namespace dsl::cpp

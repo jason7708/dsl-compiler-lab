@@ -1,5 +1,5 @@
-#include "dsl/frontend.h"
-#include "dsl/math.h"
+#include "frontend_ir.h"
+#include "frontend_math.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -16,6 +16,7 @@
 #include <clang/Lex/Preprocessor.h>
 #include <clang/Tooling/Tooling.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <format>
 #include <memory>
@@ -23,7 +24,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace dsl {
+namespace dsl::source {
 namespace {
 constexpr std::string_view runtimeHeaderName = "dsl_runtime/math.h";
 const std::string runtimeHeaderPath = std::string(DSL_RUNTIME_INCLUDE_DIR) + "/dsl_runtime/math.h";
@@ -154,10 +155,12 @@ bool checkTokens(clang::CompilerInstance &compiler, const HeaderPolicy &headers,
         }
         if (headers.options.objects &&
             (token.is(clang::tok::period) || token.is(clang::tok::kw_int) ||
-             token.is(clang::tok::kw_struct) || token.is(clang::tok::kw_if) ||
-             token.is(clang::tok::kw_else) || token.is(clang::tok::kw_throw) ||
-             token.is(clang::tok::amp) || token.is(clang::tok::ampamp) ||
-             token.is(clang::tok::pipepipe) || token.is(clang::tok::exclaim)))
+             token.is(clang::tok::kw_operator) || token.is(clang::tok::kw_this) ||
+             token.is(clang::tok::arrow) || token.is(clang::tok::kw_struct) ||
+             token.is(clang::tok::kw_if) || token.is(clang::tok::kw_else) ||
+             token.is(clang::tok::kw_throw) || token.is(clang::tok::amp) ||
+             token.is(clang::tok::ampamp) || token.is(clang::tok::pipepipe) ||
+             token.is(clang::tok::exclaim)))
             continue;
         switch (token.getKind()) {
         case clang::tok::identifier:
@@ -270,6 +273,18 @@ class Lowering final : public clang::ASTConsumer {
         std::unordered_map<std::string, const clang::FunctionDecl *> names;
         std::vector<const clang::FunctionDecl *> definitions;
         bool hasEntry = false;
+        if (headers_.options.objects) {
+            for (const auto *decl : context.getTranslationUnitDecl()->decls()) {
+                const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl);
+                if (!record || !record->isThisDeclarationADefinition() ||
+                    !headers_.dsl(compiler_, record->getLocation()))
+                    continue;
+                for (const auto *method : record->methods())
+                    if (!method->isImplicit() && method->isOverloadedOperator() &&
+                        method->getOverloadedOperator() == clang::OO_Call)
+                        computations_[record] = method;
+            }
+        }
         for (const auto *decl : context.getTranslationUnitDecl()->decls()) {
             if (decl->isImplicit())
                 continue;
@@ -301,9 +316,22 @@ class Lowering final : public clang::ASTConsumer {
             }
             if (headers_.options.objects && headers_.dsl(compiler_, decl->getLocation())) {
                 if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl)) {
-                    module_.importedNames.push_back(record->getQualifiedNameAsString());
-                    if (!collectRecord(record, false))
-                        return;
+                    if (computations_.contains(record)) {
+                        if (!collectComputation(record))
+                            return;
+                        const auto *method = computations_.at(record);
+                        dslDeclarations_.emplace(method->getCanonicalDecl(), definitions.size());
+                        definitions.push_back(method);
+                        module_.functions.push_back(
+                            Function{.name = record->getNameAsString(), .values = {}, .body = {}});
+                    } else if (!record->isThisDeclarationADefinition() &&
+                               computations_.contains(record->getDefinition())) {
+                        // The complete computation declaration is collected separately.
+                    } else {
+                        module_.importedNames.push_back(record->getQualifiedNameAsString());
+                        if (!collectRecord(record, false))
+                            return;
+                    }
                     continue;
                 }
             }
@@ -369,13 +397,14 @@ class Lowering final : public clang::ASTConsumer {
         // recursive calls. Invalid unused helper bodies are checked as well.
         definitions_ = definitions;
         for (const auto [id, definition] : definitions | std::views::enumerate) {
-            ir_ = Function{.name = definition->getNameAsString(), .values = {}, .body = {}};
+            ir_ = Function{.name = module_.functions[id].name, .values = {}, .body = {}};
             ir_.location = sourcePosition(definition->getLocation());
             ir_.returnType = *inputType(definition->getReturnType());
             ir_.returnRecord = recordName(definition->getReturnType());
             currentRegion_ = &ir_.body;
             bindings_.clear();
-            stateDecl_ = nullptr;
+            const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(definition);
+            currentComputation_ = method ? method->getParent() : nullptr;
             if (!lowerFunction(definition))
                 return;
             module_.functions[id] = std::move(ir_);
@@ -457,6 +486,226 @@ class Lowering final : public clang::ASTConsumer {
         }
         return true;
     }
+    const clang::CXXRecordDecl *computation(clang::QualType type) const {
+        const auto *record = type.getNonReferenceType()->getAsCXXRecordDecl();
+        if (!record)
+            return nullptr;
+        const auto *definition = record->getDefinition();
+        return computations_.contains(definition) ? definition : nullptr;
+    }
+    std::optional<InitialValue> initialValue(const clang::Expr *expr, Type type) {
+        if (!expr)
+            return std::nullopt;
+        expr = expr->IgnoreParens();
+        if (const auto *defaultInit = llvm::dyn_cast<clang::CXXDefaultInitExpr>(expr))
+            return initialValue(defaultInit->getExpr(), type);
+        if (const auto *init = llvm::dyn_cast<clang::InitListExpr>(expr)) {
+            if (init->getNumInits() == 1)
+                return initialValue(init->getInit(0), type);
+            if (init->getNumInits() == 0) {
+                if (type == Type::Double)
+                    return InitialValue{0.0};
+                if (type == Type::Bool)
+                    return InitialValue{false};
+                return InitialValue{0};
+            }
+        }
+        if (llvm::isa<clang::ImplicitValueInitExpr>(expr)) {
+            if (type == Type::Double)
+                return InitialValue{0.0};
+            if (type == Type::Bool)
+                return InitialValue{false};
+            return InitialValue{0};
+        }
+        if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(expr);
+            cast && cast->getCastKind() == clang::CK_IntegralToFloating && type == Type::Double) {
+            const auto *literal =
+                llvm::dyn_cast<clang::IntegerLiteral>(cast->getSubExpr()->IgnoreParens());
+            if (literal && inputType(literal->getType()) == Type::Int)
+                return InitialValue{static_cast<double>(literal->getValue().getSExtValue())};
+        }
+        if (const auto *number = llvm::dyn_cast<clang::FloatingLiteral>(expr);
+            number && type == Type::Double && plainDouble(number->getType()) &&
+            number->getValue().isFinite())
+            return InitialValue{number->getValue().convertToDouble()};
+        if (const auto *number = llvm::dyn_cast<clang::IntegerLiteral>(expr);
+            number && type == Type::Int && inputType(number->getType()) == Type::Int)
+            return InitialValue{static_cast<int>(number->getValue().getSExtValue())};
+        if (const auto *boolean = llvm::dyn_cast<clang::CXXBoolLiteralExpr>(expr);
+            boolean && type == Type::Bool)
+            return InitialValue{boolean->getValue()};
+        if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expr);
+            unary &&
+            (unary->getOpcode() == clang::UO_Plus || unary->getOpcode() == clang::UO_Minus)) {
+            auto value = initialValue(unary->getSubExpr(), type);
+            if (!value || type == Type::Bool)
+                return std::nullopt;
+            if (unary->getOpcode() == clang::UO_Minus) {
+                if (auto *number = std::get_if<double>(&*value))
+                    *number = -*number;
+                else if (auto *number = std::get_if<int>(&*value))
+                    *number = -*number;
+            }
+            return value;
+        }
+        return std::nullopt;
+    }
+    // Flatten the instance's scalar leaves and their explicitly defined defaults.
+    // Child aggregate initializers can override their own member defaults.
+    bool flatten(const clang::CXXRecordDecl *record, const clang::Expr *initializer,
+                 const std::string &prefix, std::vector<RecordField> &fields, unsigned depth = 0) {
+        if (depth > 64 || fields.size() > 100000) {
+            error(record->getLocation(), "computation state layout exceeds size/depth limit");
+            return false;
+        }
+        if (initializer)
+            initializer = initializer->IgnoreParens();
+        if (const auto *defaultInit =
+                llvm::dyn_cast_or_null<clang::CXXDefaultInitExpr>(initializer))
+            initializer = defaultInit->getExpr();
+        if (const auto *ctor = llvm::dyn_cast_or_null<clang::CXXConstructExpr>(initializer);
+            ctor && ctor->getConstructor()->isDefaultConstructor() && ctor->getNumArgs() == 0)
+            initializer = nullptr;
+        const auto *init = llvm::dyn_cast_or_null<clang::InitListExpr>(initializer);
+        if (initializer && !init) {
+            error(initializer->getExprLoc(),
+                  "computation initialization requires an aggregate or default initializer");
+            return false;
+        }
+        if (init && !init->isSemanticForm())
+            init = init->getSemanticForm();
+        unsigned index = 0;
+        for (const auto *field : record->fields()) {
+            const auto *value = init && index < init->getNumInits()
+                                    ? init->getInit(index)
+                                    : field->getInClassInitializer();
+            ++index;
+            const auto name = prefix + field->getNameAsString();
+            if (const auto *child = computation(field->getType())) {
+                if (!flatten(child, value, name + "_", fields, depth + 1))
+                    return false;
+            } else {
+                const auto type = inputType(field->getType());
+                if (!type || *type == Type::Record) {
+                    error(field->getLocation(),
+                          "computation members must be scalar values or computation instances");
+                    return false;
+                }
+                auto initial = initialValue(value, *type);
+                if (!initial) {
+                    error(value ? value->getExprLoc() : field->getLocation(),
+                          "state fields require literal initializers (double, int or bool)");
+                    return false;
+                }
+                if (std::ranges::find(fields, name, &RecordField::name) != fields.end()) {
+                    error(field->getLocation(), "flattened state field name collision: " + name);
+                    return false;
+                }
+                fields.push_back({name, *type, *initial});
+            }
+        }
+        return true;
+    }
+    bool collectComputation(const clang::CXXRecordDecl *record) {
+        if (!record->isStruct() || !record->getIdentifier() || record->hasAttrs() ||
+            !record->isAggregate() || !record->isStandardLayout() ||
+            !record->isTriviallyCopyable() || record->getNumBases() ||
+            record->getDescribedClassTemplate()) {
+            error(record->getLocation(), "computations must be public aggregate structs without "
+                                         "inheritance or constructors");
+            return false;
+        }
+        const clang::CXXMethodDecl *operation = nullptr;
+        for (const auto *member : record->decls()) {
+            if (member->isImplicit())
+                continue;
+            if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(member)) {
+                if (operation || !method->isOverloadedOperator() ||
+                    method->getOverloadedOperator() != clang::OO_Call || method->isStatic() ||
+                    method->isVirtual() || method->isVolatile() ||
+                    method->getRefQualifier() != clang::RQ_None ||
+                    method->getAccess() != clang::AS_public ||
+                    !method->doesThisDeclarationHaveABody() || !validSignature(method)) {
+                    error(member->getLocation(), "a computation requires exactly one public "
+                                                 "operator() definition and no other methods");
+                    return false;
+                }
+                operation = method;
+            } else if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(member);
+                       field && field->getAccess() == clang::AS_public && !field->isBitField() &&
+                       !field->isMutable() && !field->hasAttrs() && field->getIdentifier() &&
+                       !field->getType().hasQualifiers()) {
+                if (!computation(field->getType()) && !field->hasInClassInitializer()) {
+                    error(field->getLocation(), "state fields require explicit initializers");
+                    return false;
+                }
+            } else {
+                error(member->getLocation(), "unsupported computation member");
+                return false;
+            }
+        }
+        RecordDeclaration state{
+            .name = record->getNameAsString() + "_state", .fields = {}, .external = false};
+        if (!flatten(record, nullptr, "", state.fields))
+            return false;
+        module_.records.push_back(std::move(state));
+        return true;
+    }
+    struct InstanceLocation {
+        ValueId base;
+        std::string prefix;
+        const clang::CXXRecordDecl *record;
+    };
+    std::optional<InstanceLocation> instance(const clang::Expr *expr) {
+        expr = expr->IgnoreParenImpCasts();
+        if (llvm::isa<clang::CXXThisExpr>(expr) && currentComputation_)
+            return InstanceLocation{*ir_.stateParameter, "", currentComputation_};
+        if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(expr);
+            ref && computation(ref->getType()) && bindings_.contains(ref->getDecl()))
+            return InstanceLocation{bindings_.at(ref->getDecl()), "", computation(ref->getType())};
+        if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expr);
+            member && computation(member->getType()) &&
+            llvm::isa<clang::FieldDecl>(member->getMemberDecl())) {
+            if (auto parent = instance(member->getBase()))
+                return InstanceLocation{
+                    parent->base, parent->prefix + member->getMemberNameInfo().getAsString() + "_",
+                    computation(member->getType())};
+        }
+        return std::nullopt;
+    }
+    std::optional<ValueId> objectCall(const clang::CXXOperatorCallExpr *call) {
+        const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(call->getDirectCallee());
+        if (!method || call->getOperator() != clang::OO_Call ||
+            !dslDeclarations_.contains(method->getCanonicalDecl())) {
+            error(call->getExprLoc(), "only registered computation operator() calls are supported");
+            return std::nullopt;
+        }
+        const auto receiver = instance(call->getArg(0));
+        if (!receiver) {
+            error(call->getExprLoc(), "call a named member or local computation instance");
+            return std::nullopt;
+        }
+        std::vector<ValueId> arguments;
+        for (unsigned index = 1; index < call->getNumArgs(); ++index) {
+            const auto value = expression(call->getArg(index));
+            if (!value)
+                return std::nullopt;
+            arguments.push_back(
+                add(Reference{*value, ""}, ir_.values[*value].type, ir_.values[*value].recordName));
+        }
+        std::vector<RecordField> fields;
+        if (!flatten(receiver->record, nullptr, "", fields))
+            return std::nullopt;
+        std::vector<std::string> names;
+        for (const auto &field : fields)
+            names.push_back(receiver->prefix + field.name);
+        arguments.push_back(add(StateView{receiver->base, std::move(names)}, Type::Record,
+                                receiver->record->getNameAsString() + "_state"));
+        return add(Call{DslFunction{dslDeclarations_.at(method->getCanonicalDecl())},
+                        std::move(arguments), sourcePosition(call->getExprLoc())},
+                   *inputType(call->getType()), recordName(call->getType()));
+    }
+
     bool collectRecord(const clang::CXXRecordDecl *record, bool external = true) {
         if (!record->isThisDeclarationADefinition())
             return true;
@@ -490,7 +739,7 @@ class Lowering final : public clang::ASTConsumer {
     std::optional<Type> inputType(clang::QualType type) const {
         if (const auto scalar = scalarType(type))
             return scalar;
-        if (!headers_.options.objects || type.hasQualifiers())
+        if (!headers_.options.objects || type.hasQualifiers() || computation(type))
             return std::nullopt;
         if (type->isSpecificBuiltinType(clang::BuiltinType::Int) &&
             compiler_.getASTContext().getTypeSize(type) == 32)
@@ -514,23 +763,31 @@ class Lowering final : public clang::ASTConsumer {
             (function->getStorageClass() != clang::SC_None &&
              !(external && function->getStorageClass() == clang::SC_Extern)) ||
             function->hasAttrs() || function->isInlineSpecified() || function->isConstexpr()) {
-            error(function->getLocation(),
-                  "DSL functions must have an unqualified double return type and no modifiers");
+            error(
+                function->getLocation(),
+                headers_.options.objects && !external
+                    ? "computation results must be double, bool, int or flat records without "
+                      "modifiers"
+                    : "DSL functions must have an unqualified double return type and no modifiers");
             return false;
         }
         for (const auto *parameter : function->parameters()) {
             const auto original = parameter->getOriginalType();
-            const bool state = headers_.options.objects && !external &&
-                               original->isLValueReferenceType() &&
-                               inputType(original.getNonReferenceType()) == Type::Record &&
-                               parameter == function->getParamDecl(function->getNumParams() - 1);
+            if (headers_.options.objects && original->isReferenceType()) {
+                error(parameter->getLocation(), "reference parameters are not supported; declare "
+                                                "persistent state as computation struct members");
+                return false;
+            }
             const auto type = inputType(original);
             const bool allowed = headers_.options.objects
-                                     ? (state || (type && !(external && *type == Type::Record)))
+                                     ? (type && !(external && *type == Type::Record))
                                      : plainDouble(parameter->getOriginalType());
             if (!allowed || parameter->hasDefaultArg() || parameter->hasAttrs()) {
-                error(parameter->getLocation(), "parameters must be unqualified double without "
-                                                "default arguments or attributes");
+                error(parameter->getLocation(), headers_.options.objects
+                                                    ? "parameters must be supported value types "
+                                                      "without default arguments or attributes"
+                                                    : "parameters must be unqualified double "
+                                                      "without default arguments or attributes");
                 return false;
             }
         }
@@ -544,8 +801,7 @@ class Lowering final : public clang::ASTConsumer {
                     ++records;
             }
             if (records && events != 1) {
-                error(function->getLocation(), "a record event must be the only event parameter "
-                                               "(an optional State& may follow)");
+                error(function->getLocation(), "a record event must be the only event parameter");
                 return false;
             }
         }
@@ -556,17 +812,16 @@ class Lowering final : public clang::ASTConsumer {
             const auto original = parameter->getOriginalType();
             const auto type = *inputType(original.getNonReferenceType());
             const auto record = recordName(original);
-            const bool state = original->isReferenceType();
-            const auto id = add(Parameter{.name = parameter->getNameAsString(),
-                                          .recordName = record,
-                                          .state = state},
-                                type, record);
+            const auto id =
+                add(Parameter{.name = parameter->getNameAsString(), .recordName = record}, type,
+                    record);
             bindings_.emplace(parameter, id);
-            if (state) {
-                ir_.stateParameter = id;
-                ir_.stateRecord = record;
-                stateDecl_ = parameter;
-            }
+        }
+        if (currentComputation_) {
+            ir_.stateRecord = currentComputation_->getNameAsString() + "_state";
+            ir_.stateParameter =
+                add(Parameter{.name = "state", .recordName = ir_.stateRecord, .state = true},
+                    Type::Record, ir_.stateRecord);
         }
         const auto *body = llvm::dyn_cast<clang::CompoundStmt>(function->getBody());
         if (headers_.options.objects) {
@@ -743,6 +998,32 @@ class Lowering final : public clang::ASTConsumer {
         if (const auto *declarations = llvm::dyn_cast<clang::DeclStmt>(statement)) {
             for (const auto *decl : declarations->decls()) {
                 const auto *local = llvm::dyn_cast<clang::VarDecl>(decl);
+                if (local && computation(local->getType())) {
+                    if (local->getStorageClass() != clang::SC_None || local->hasAttrs() ||
+                        local->isConstexpr() || local->getType().hasQualifiers()) {
+                        error(local->getLocation(),
+                              "local computation instances must be plain values");
+                        return std::nullopt;
+                    }
+                    std::vector<RecordField> fields;
+                    if (!flatten(computation(local->getType()), local->getInit(), "", fields))
+                        return std::nullopt;
+                    std::vector<ValueId> values;
+                    for (const auto &field : fields) {
+                        if (const auto *v = std::get_if<double>(&*field.initial))
+                            values.push_back(add(Constant{*v}));
+                        else if (const auto *v = std::get_if<int>(&*field.initial))
+                            values.push_back(add(IntegerConstant{*v}, Type::Int));
+                        else
+                            values.push_back(
+                                add(BooleanConstant{std::get<bool>(*field.initial)}, Type::Bool));
+                    }
+                    const auto record = computation(local->getType())->getNameAsString() + "_state";
+                    const auto init = add(RecordInit{std::move(values)}, Type::Record, record);
+                    bindings_.emplace(local, add(Reference{init, local->getNameAsString()},
+                                                 Type::Record, record));
+                    continue;
+                }
                 const auto type =
                     local ? inputType(local->getType().getUnqualifiedType()) : std::nullopt;
                 if (!local || !type || !local->hasInit() ||
@@ -777,15 +1058,24 @@ class Lowering final : public clang::ASTConsumer {
                     return false;
                 }
             }
+            if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(lhs)) {
+                if (const auto receiver = instance(member->getBase());
+                    receiver && llvm::isa<clang::FieldDecl>(member->getMemberDecl()) &&
+                    inputType(member->getType())) {
+                    append(FieldStore{receiver->base,
+                                      receiver->prefix + member->getMemberNameInfo().getAsString(),
+                                      *rhs});
+                    return false;
+                }
+            }
             if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(lhs);
                 member && !member->isArrow()) {
                 const auto *base =
                     llvm::dyn_cast<clang::DeclRefExpr>(member->getBase()->IgnoreParenImpCasts());
                 const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
                 if (base && field && bindings_.contains(base->getDecl()) &&
-                    (base->getDecl() == stateDecl_ ||
-                     (llvm::isa<clang::VarDecl>(base->getDecl()) &&
-                      !llvm::isa<clang::ParmVarDecl>(base->getDecl())))) {
+                    (llvm::isa<clang::VarDecl>(base->getDecl()) &&
+                     !llvm::isa<clang::ParmVarDecl>(base->getDecl()))) {
                     append(
                         FieldStore{bindings_.at(base->getDecl()), field->getNameAsString(), *rhs});
                     return false;
@@ -794,6 +1084,11 @@ class Lowering final : public clang::ASTConsumer {
             error(assignment->getOperatorLoc(), "assignment requires a local variable or a state "
                                                 "field; event inputs are read-only");
             return std::nullopt;
+        }
+        if (const auto *call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(statement)) {
+            if (!objectCall(call))
+                return std::nullopt;
+            return false;
         }
         error(statement->getBeginLoc(),
               std::format("unsupported statement: {}", statement->getStmtClassName()));
@@ -857,7 +1152,16 @@ class Lowering final : public clang::ASTConsumer {
                 copy->getConstructor()->isTrivial() && copy->getNumArgs() == 1 &&
                 inputType(copy->getType()) == Type::Record)
                 return expression(copy->getArg(0));
+            if (const auto *call = llvm::dyn_cast<clang::CXXOperatorCallExpr>(expr))
+                return objectCall(call);
             if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expr)) {
+                if (const auto receiver = instance(member->getBase());
+                    receiver && llvm::isa<clang::FieldDecl>(member->getMemberDecl()) &&
+                    inputType(member->getType().getUnqualifiedType())) {
+                    return add(Member{receiver->base,
+                                      receiver->prefix + member->getMemberNameInfo().getAsString()},
+                               *inputType(member->getType().getUnqualifiedType()));
+                }
                 const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
                 if (!field || member->isArrow() || !inputType(field->getType())) {
                     error(member->getExprLoc(), "only flat event field reads are supported");
@@ -941,6 +1245,10 @@ class Lowering final : public clang::ASTConsumer {
                       "only direct runtime or DSL function calls are supported");
                 return std::nullopt;
             }
+            if (llvm::isa<clang::CXXMethodDecl>(callee)) {
+                error(call->getExprLoc(), "use instance(arguments) to call a computation");
+                return std::nullopt;
+            }
             const auto *canonical = callee->getCanonicalDecl();
             std::optional<CallTarget> target;
             std::size_t arity = 0;
@@ -981,16 +1289,8 @@ class Lowering final : public clang::ASTConsumer {
                         "function arguments must match the declared type (double in scalar mode)");
                     return std::nullopt;
                 }
-                if (callee->getParamDecl(index)->getOriginalType()->isReferenceType() &&
-                    (!ir_.stateParameter || *value != *ir_.stateParameter)) {
-                    error(argument->getExprLoc(),
-                          "a stateful DSL call must receive the caller's explicit state parameter");
-                    return std::nullopt;
-                }
-                // A by-value argument is a snapshot, even when the callee also
-                // receives and updates the same record as its explicit state.
-                if (headers_.options.objects && std::holds_alternative<DslFunction>(*target) &&
-                    !callee->getParamDecl(index)->getOriginalType()->isReferenceType())
+                // Keep by-value arguments as snapshots in the ordered object IR.
+                if (headers_.options.objects && std::holds_alternative<DslFunction>(*target))
                     arguments.push_back(add(Reference{*value, ""}, ir_.values[*value].type,
                                             ir_.values[*value].recordName));
                 else
@@ -1138,7 +1438,8 @@ class Lowering final : public clang::ASTConsumer {
     Region *currentRegion_ = &ir_.body;
     std::unordered_map<const clang::FunctionDecl *, MathFunction> builtinDeclarations_;
     std::unordered_map<const clang::ValueDecl *, ValueId> bindings_;
-    const clang::ParmVarDecl *stateDecl_ = nullptr;
+    std::unordered_map<const clang::CXXRecordDecl *, const clang::CXXMethodDecl *> computations_;
+    const clang::CXXRecordDecl *currentComputation_ = nullptr;
 };
 
 class Action final : public clang::ASTFrontendAction {
@@ -1163,7 +1464,7 @@ class Action final : public clang::ASTFrontendAction {
 };
 } // namespace
 
-std::optional<Module> compile(std::string_view source, std::string_view filename,
+std::optional<Module> parse(std::string_view source, std::string_view filename,
                               const CompileOptions &options) {
     std::optional<Module> result;
     HeaderPolicy headers{.options = options, .included = {}, .macros = {}};

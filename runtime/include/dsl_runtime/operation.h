@@ -5,21 +5,18 @@
 #include <utility>
 
 namespace dsl_runtime {
-template <class Result, class Intent, class State> struct operation_output {
+template <class Result, class State> struct operation_output {
     Result result;
-    Intent intent;
     State new_state;
 };
 
-template <class Context, class State, class Event, class Result, class Error, class Intent>
-struct contract {
+template <class Context, class State, class Event, class Result, class Error> struct contract {
     using context = Context;
     using state = State;
     using event = Event;
     using result = Result;
     using error = Error;
-    using intent = Intent;
-    using output = operation_output<Result, Intent, State>;
+    using output = operation_output<Result, State>;
     using response = std::expected<output, Error>;
 };
 

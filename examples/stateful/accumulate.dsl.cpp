@@ -1,6 +1,10 @@
 #include "pricing.dsl.h"
 
-Totals accumulate_mid(MarketEvent event, Ledger& state) {
-    Quote quote = read_quote(event);
-    return accumulate_value(quote.mid, state);
-}
+struct accumulate_mid {
+    accumulate_value accumulator;
+
+    Totals operator()(MarketEvent event) {
+        Quote quote = read_quote(event);
+        return accumulator(quote.mid);
+    }
+};

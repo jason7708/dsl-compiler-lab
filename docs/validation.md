@@ -1,6 +1,6 @@
 # 本次建置與驗證紀錄
 
-日期：2026-09-06。以下為加入 object 控制流程、record result、state／typed error 與 library JSON 設定後，在此 workspace 實際重新建置與執行的結果。
+日期：2026-09-08。以下為完成共用 IR 分層、獨立 verifier、C++ backend 遷移，並保留 struct state／typed error 行為後，在此 workspace 實際重新建置與執行的結果。
 
 ## 環境
 
@@ -63,24 +63,33 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-CMake configure 成功，compiler 的 5 個 C++ translation units 編譯並連結成功；runtime 的 `math.cpp` 另編譯成 `libdsl_runtime.a`。LLVM configure 顯示未找到 LibEdit、zstd、CURL 等選用依賴；此工具使用的 AST／Tooling 路徑不需要它們，沒有阻擋建置或測試。
+CMake configure 成功，`dsl_ir`、`dsl_cpp_backend`、`dslc` 與兩個 C++ 測試程式編譯並連結成功；runtime 的 `math.cpp` 另編譯成 `libdsl_runtime.a`。LLVM configure 顯示未找到 LibEdit、zstd、CURL 等選用依賴；此工具使用的 AST／Tooling 路徑不需要它們，沒有阻擋建置或測試。
 
 ## 實際測試結果
 
 ```text
-1/2 Test #1: compiler_integration ............. Passed 45.85 sec
-2/2 Test #2: object_integration ............... Passed  4.24 sec
-100% tests passed, 0 tests failed out of 2
-Total Test time (real) = 50.09 sec
+1/4 Test #1: ir_verifier ...................... Passed  0.00 sec
+2/4 Test #2: backend_boundary ................. Passed  0.00 sec
+3/4 Test #3: compiler_integration ............. Passed 49.16 sec
+4/4 Test #4: object_integration ............... Passed  6.49 sec
+100% tests passed, 0 tests failed out of 4
+Total Test time (real) = 55.65 sec
 ```
 
-這是 **2 個 CTest entries、32 個 Python unittest 方法**：scalar／external suite 15 個，object suite 17 個。其中資料驅動案例包含：
+這是 **4 個 CTest entries**：49 個直接構造 IR 的 verifier 案例、16 個 backend API 邊界案例，以及 **40 個 Python unittest 方法**（scalar／external 15 個、object 25 個）。
+
+Verifier 案例涵蓋型別／值／OP／constant ID、arity、定義唯一性、ancestor capture／sibling escape、call signature、error、missing／invalid terminator、欄位及 registry。Backend 案例直接建構 Program，驗證 source-independent codegen、metadata 拒絕、backend 自行驗證核心，以及「共用 IR 接受 binary32、目前 C++ backend 明確拒絕」的能力分工。
+
+其中資料驅動案例包含：
 
 - Object suite：context 準備／純計算分工、無 provider 實作的手動 context、多次呼叫不合併讀取、DSL library 組合、延遲數學分支、生成 header 多個 translation units，以及外部 record／library／CLI 拒絕案例。
 - 真正 DSL 的 stateful helper 組合、成功提交、第二個 helper 失敗時整次事件 rollback、不同 unit 隔離，以及直接呼叫不改動輸入 state。
 - if/else、early return、local scalar／record 欄位賦值、作用域遮蔽、record result 及 bool／int 回傳。
 - 短路和未選取分支不執行 fallible helper；typed error 自動傳播。生成程式另以 `-fno-exceptions` 編譯執行。
-- 值參數與 state 同源時仍保留 event 副本的語意。
+- 同一子物件重複呼叫共用 state、不同子物件隔離、三層組合與初值，對照相同原始 struct 的普通 C++ 執行結果。
+- 區域計算物件每次事件重新建立；literal 初值、子物件 aggregate 初值覆蓋、this／巢狀 scalar 成員讀寫。
+- 不同子物件的失敗提交邊界、const operator、provider 抽取，以及生成碼不含 intent。
+- 17 組 struct 拒絕案例：舊 reference state、未初始化／非 literal 初值、constructor／其他 method、state 欄位撞名、計算物件 event、條件及 state 依賴 provider。
 - 14 組新增 feature 拒絕案例，涵蓋不同 error type、state 來源、提前退出後的 context 讀取及尚未支援的語法。
 - JSON 相對路徑、重複 imports、CLI 組合、imported config 覆寫保護，以及 9 組無效設定案例和缺少 CLI 參數。
 - Repo 的 stateful library 範例作為 object suite 的一個端到端測試。
@@ -98,9 +107,9 @@ Total Test time (real) = 50.09 sec
 - 精確錯誤行／欄檢查。
 - CLI、輸入不存在、同檔案／symlink 保護、輸出目錄不存在、輸出寫入失敗的檢查。
 
-先前切換 C++23 時，既有測試發現直接回傳參數／區域變數時，Clang 會加入 `NoOp` lvalue-to-xvalue 隱式節點。Lowering 已限定接受不改變 double 型別和值的此類引用，並增加兩組括號回傳與負零的測試。目前使用實體 runtime header／library，IR 有 Module、DSL function 與 external function call target；外部介面由可重複的 `--extern-header` 登記。改用實體 header 後，3 組參數數量錯誤測試的預期診斷改為 Clang 實際的 too many／too few arguments；上面結果是完成修改後的完整重跑。
+先前切換 C++23 時，既有測試發現直接回傳參數／區域變數時，Clang 會加入 `NoOp` lvalue-to-xvalue 隱式節點。Lowering 已限定接受不改變 double 型別和值的此類引用，並增加兩組括號回傳與負零的測試。目前使用實體 runtime header／library，核心以 registered math opcode、Call 與 ExternalCall 表示運算；外部介面由可重複的 `--extern-header` 登記。改用實體 header 後，3 組參數數量錯誤測試的預期診斷改為 Clang 實際的 too many／too few arguments；上面結果是完成修改後的完整重跑。
 
-另已檢查 `build/compile_commands.json`，確認 compiler 的 6 個 translation units 均使用 `-std=c++23`；`build/build-info.txt` 也記錄 host 與 DSL／生成結果的 C++23 設定。
+另已檢查 `build/compile_commands.json`，確認各模組均使用 `-std=c++23`；`build/build-info.txt` 也記錄 host 與 DSL／生成結果的 C++23 設定。
 
 ## 驗收範例的端到端執行
 
@@ -112,7 +121,7 @@ g++ -std=c++23 -O2 -fno-fast-math -ffp-contract=off \
 build/average
 ```
 
-實際 stdout 為 `3`，退出碼為 0。IR 與生成的 C++ 已列於 README；目前 workspace 可直接檢查 `build/average.cpp` 並執行 `build/average`。
+實際 stdout 為 `3`，退出碼為 0。核心 IR 已列於 README；目前 workspace 可直接檢查 `build/average.cpp` 並執行 `build/average`。
 
 本次以 GCC 16.1.0／libstdc++ 16.1.0 建置 compiler 和生成程式，DSL 解析連結 Clang LibTooling 20.1.8，於 Linux x86_64 驗證；未宣稱已在其他作業系統、架構或 LLVM 版本通過。
 
@@ -138,7 +147,7 @@ g++ -std=c++23 -O2 -fno-fast-math -ffp-contract=off \
 build/functions
 ```
 
-實際 stdout 為 `5`、退出碼為 0。IR 包含 square、length、compute 三個函數，以及 DSL helper 和 runtime API 兩種 call。
+實際 stdout 為 `5`、退出碼為 0。IR 包含 square、length、compute 三個函數，以及 DSL helper Call 和數學 opcode。
 
 也已實際執行：
 
@@ -164,7 +173,7 @@ g++ -std=c++23 -O2 -fno-fast-math -ffp-contract=off \
 build/external
 ```
 
-實際 stdout 為 `5`、退出碼為 0。IR 包含 `extern @external_ops::weighted_sum(double, double) -> double`，以及 `score`、`compute` 的 body；生成 C++ 呼叫 `::external_ops::weighted_sum`，實作來自另編譯的 object。介面限制與 C ABI 範例見 [external-functions.md](external-functions.md)。
+實際 stdout 為 `5`、退出碼為 0。IR 包含以 ExternalId 表示的邏輯外部介面，以及 `score`、`compute` 的 body；生成 C++ 呼叫 `::external_ops::weighted_sum`，實作來自另編譯的 object。介面限制與 C ABI 範例見 [external-functions.md](external-functions.md)。
 
 
 ## Function object 與 context binding
@@ -189,7 +198,7 @@ difference = 2
 manual mid = 12
 ```
 
-退出碼為 0。外部 provider 只出現在生成的 `prepare_*_context`；`operator()` 從 context 讀取資料。新測試也驗證手動 context 不需連結 provider，以及同一份生成 header 可以跨 C++ translation units 使用。此無 state 範例生成空 state／error／intent；下面的新增範例則使用 DSL 宣告實際 state 與 error。Intent 路由仍未加入。
+退出碼為 0。外部 provider 只出現在生成的 `prepare_*_context`；`operator()` 從 context 讀取資料。新測試也驗證手動 context 不需連結 provider，以及同一份生成 header 可以跨 C++ translation units 使用。此無 state 範例生成空 state／error；下面的範例則使用 DSL struct 宣告實際 state。Intent 已從 runtime 與生成介面移除。
 
 本次 `/tmp` 中的 Clang 開發標頭已被清除，重新下載同版本 `libclang-20-dev` 並解壓到原路徑後成功建置，沒有修改系統安裝。一次 object 測試曾發現未命名參數的生成欄位與使用者的 `arg_0` 撞名，已修正命名並在完整回歸中通過。完整介面與限制見 [function-objects.md](function-objects.md)。
 
@@ -217,4 +226,28 @@ invalid quote = 1, provider reads = 8
 
 退出碼為 0。Driver 驗證成功事件提交，超過上限的 error 保留 total／count，錯誤報價自動向外傳播，以及 binder 的讀取次數。完整語意見 [state-and-errors.md](state-and-errors.md)。
 
-第一輪回歸捕捉到擴充 NoOp 判斷時誤擋 scalar const double 回傳，已修正並重跑全部測試。原本拒絕 local 賦值與 record local 的 object 案例改成實際運算驗證；不完整 return 的預期診斷採 Clang `-Werror` 實際輸出。上述 50.09 秒是完成這些修正後的完整通過結果。
+本次已將範例改為 `struct accumulate_mid` 持有 `accumulate_value accumulator` 成員，生成 `accumulator_total`／`accumulator_count` 兩個平坦 state 欄位。預設 unit 使用成員初值，provider 與 typed error 行為保留。
+
+本次 build 所用 `/tmp` Clang 標頭已被清除，重新下載並解壓相同版本的 libclang-20-dev 後完成建置；未變更系統安裝。完整回歸結果如上，包含既有 scalar／external suite 與新增 struct 實例測試。
+
+## 獨立 core／backend 建置
+
+```sh
+cmake -S . -B build-core -G Ninja \
+  -DDSL_BUILD_COMPILER=OFF -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc
+cmake --build build-core -j2
+ctest --test-dir build-core --output-on-failure
+```
+
+Configure 沒有查找 LLVM／Clang，產生 `libdsl_ir.a` 與 `libdsl_cpp_backend.a`。兩個 CTest 項目 `ir_verifier`、`backend_boundary` 全部通過。此模式不建立 CLI 或 runtime，證明公開核心與 C++ backend 能在沒有 frontend 連結依賴的情況下使用。
+
+IR dump 的既有文字斷言已更新為 `computation_ir v1`；端到端運算、provider、state／error、浮點 bits 與拒絕行為維持測試。尚未實作或驗證 ISA target、跨平台硬體 ABI、serialization 或 optimizer，詳見 [IR 架構](ir-architecture.md)。
+
+## 不同生成 library 的名稱隔離修正
+
+修正前用 plus_one／times_two 兩份不同 bundle 重現內部 f0 衝突：同檔 include 編譯失敗，分檔在 GCC `-O0` 連結執行得到 11、11，預期為 11、20。
+
+修正後 backend 以最小 export 名稱建立各自 namespace，原始重現案例已得到 11、20。Object suite 新增三個測試方法，涵蓋兩份 header 在 `-O0`／`-O2` 下交換 include 順序、真正分別編譯成 `.o` 並交換連結順序、scalar／object 混合連結，以及來源／輸出搬移的穩定生成。
+
+Backend API 另驗證獨立 namespace、export 排序穩定性及空 export 的拒絕。上方 CTest 數字是完成此次修正後的完整重跑；獨立 `DSL_BUILD_COMPILER=OFF` 建置也重新通過。完整問題與保留限制見 [工作紀錄](roadmap.md)。

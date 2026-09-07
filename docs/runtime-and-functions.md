@@ -139,71 +139,27 @@ double compute(double x) {
 
 條件選值保持 lazy，基底情況不會執行遞迴分支。Compiler 不做遞迴展開或終止性分析。
 
-## AST → Module IR
+## AST → 共用 IR
 
-`HandleTranslationUnit()` 分兩階段處理：
+Frontend 先收集 runtime API 與所有使用者函數宣告，以 canonical declaration identity 綁定目標，再逐一驗證及 lower 函數本體。因此 scalar helper 可以指向尚未 lower 的函數或自身。
 
-1. 收集實體 runtime header 的 API 與所有使用者函數宣告，檢查簽名、overload、定義與入口，建立 canonical declaration → `FunctionId` 的表。
-2. 逐一驗證及 lower 每個函數 body。函數呼叫使用第一階段已建立的表，因此可以指向尚未 lower 的函數或自身。
+Frontend 的來源呼叫資訊經 semantic 轉換後，全部使用共用 Operation：
 
-每個 `Function` 有自己的 values 表與 body region；value ID 在函數內使用，function ID 則在 module 內使用。
+| 呼叫來源 | 核心表示 | C++ backend |
+| --- | --- | --- |
+| `dsl_math::sqrt(x)` | Sqrt opcode 與 operand ValueId | 呼叫 `dsl_math::sqrt` |
+| DSL helper | Call opcode 與 FunctionId | 呼叫生成的內部函數 |
+| 已登記外部函數 | ExternalCall opcode 與 ExternalId | 由 CppLinkage 找到限定 symbol |
 
-`Call` 的目標改成：
+沒有把 C++ 呼叫文字貼進 IR。每個函數有自己的 ValueId 與 body region；FunctionId 是 module 內的引用。函數結果型別與可失敗的 error 型別分開表示，ReturnSuccess 與 ReturnError 也是不同 terminator。
 
-```cpp
-struct DslFunction { FunctionId id; };
-struct ExternalFunction { std::size_t id; };
-using CallTarget = std::variant<MathFunction, DslFunction, ExternalFunction>;
+## C++ codegen
 
-struct Call {
-    CallTarget target;
-    std::vector<ValueId> arguments;
-};
-```
+C++ backend 先輸出全部函數的 prototype，再產生定義。內部名稱位於 `dsl_backend::module_<最小 export 名稱>` namespace，以 FunctionId 生成 `f0` 等名稱；內部成功結果使用 tuple，公開 scalar `compute` wrapper 取出第一個結果。
 
-`MathFunction` 指向已驗證的 runtime API；`DslFunction` 指向 module 中另一個函數。`ExternalFunction` 指向已登記的外部函數。三者都保存 IR 值引用，不複製來源呼叫文字。呼叫只接受直接的 runtime／DSL／已登記外部函數，仍拒絕函數指標與任意 C++ 呼叫。
+DSL helper 的定義來自共用 IR，`dsl_math` 的實作來自連結的 runtime library。這些 C++ 名稱、tuple 與 library 呼叫是 backend 策略，ISA backend 不需要沿用。
 
-IR 顯示保留來源函數名稱，例如：
-
-```text
-func @square -> double {
-  %0 : double = param x
-  %1 : double = mul %0, %0
-  return %1
-}
-func @compute -> double {
-  %0 : double = param a
-  %1 : double = call @square(%0)
-  %2 : double = call @dsl_math::sqrt(%1)
-  return %2
-}
-```
-
-## Module codegen
-
-Codegen 先輸出所有函數的 prototype，再輸出每個定義。因此生成結果中的相互呼叫不依賴定義順序。
-
-對外入口保留 `compute` 名稱；helper 以 function ID 產生內部 `static` 名稱，例如 `dsl_function_0`，避免與使用者變數或 runtime API 撞名。
-
-```cpp
-#include <dsl_runtime/math.h>
-
-static double dsl_function_0(double v0);
-double compute(double v0);
-
-static double dsl_function_0(double v0) {
-    const double v1 = (v0 * v0);
-    return v1;
-}
-
-double compute(double v0) {
-    const double v1 = dsl_function_0(v0);
-    const double v2 = dsl_math::sqrt(v1);
-    return v2;
-}
-```
-
-`dsl_function_0` 的定義來自 DSL IR；`dsl_math::sqrt` 的定義來自連結的 runtime library，兩者的來源清楚區分。
+Object 模式目前會在 frontend 展開 helper，收集其完整 context 需求，並使用 Evaluate 保留內嵌呼叫的 return 邊界；此模式拒絕遞迴。Scalar 模式保留 Call 與既有遞迴支援。完整資料模型與 verifier 規則見 [IR 架構](ir-architecture.md)。
 
 ## 驗證
 

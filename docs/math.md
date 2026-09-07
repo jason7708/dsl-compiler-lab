@@ -100,54 +100,46 @@ return enabled ? magnitude : b;
 
 使用者明確 include [runtime/include/dsl_runtime/math.h](../runtime/include/dsl_runtime/math.h)，並以 `dsl_math::` 呼叫。實作位於 [runtime/src/math.cpp](../runtime/src/math.cpp)，建成 `dsl_runtime` library，生成程式需連結它。
 
-[include/dsl/math.h](../include/dsl/math.h) 的 `mathBuiltins` 保存 compiler 使用的 API metadata。Frontend 檢查 include 真正解析到配置的實體 header，再驗證其中的 namespace、函數簽名與 canonical declaration identity。沒有虛擬標頭或隱含宣告。
+[frontend_math.h](../src/frontend_math.h) 保存 frontend 的來源 API metadata。Frontend 檢查 include 真正解析到配置的實體 header，再驗證 namespace、函數簽名與 canonical declaration identity。沒有虛擬標頭或隱含宣告。
 
-同一份輸入內的 DSL helper 也可以呼叫；函數表先建立，body 再逐一 lower。`CallTarget` 區分 runtime API、DSL function ID 與 external function ID；外部介面見 [external-functions.md](external-functions.md)。參考 [runtime-and-functions.md](runtime-and-functions.md)。
+### 共用 IR 與分支
 
-### Typed IR 與分支
+語意轉換把數學 API 變成 registered opcode，例如 Sqrt、Pow；DSL helper 是帶 FunctionId 的 Call，外部函數是帶 ExternalId 的 ExternalCall。三者使用相同 Operation 結構，型別與 arity 由獨立 verifier 檢查，C++ symbol 不在核心數學 OP 中。
 
-IR 增加了 `Type::Bool`、`BooleanConstant`、`Unary`、`Call`、`Select`，`BinaryOp` 增加六種比較。`Call` 保存 runtime enum 或 DSL function ID，以及已 lower 的 argument value IDs，不保存來源呼叫文字。
-
-原先函數只有一個平面的執行序列；現在用 `Region` 記錄某個作用域要執行的 instruction IDs，以及其結果 ID。`Function::body` 是頂層 region，每個 `Select` 擁有 true／false 兩個 region。
-
-例如 `a >= 0.0 ? dsl_math::sqrt(a) : 0.0` 的結構為：
+`?:` 轉成帶兩個 region 的 If。每個分支以 Yield 交付結果；只執行被選中的分支。以下為 `a >= 0.0 ? dsl_math::sqrt(a) : 0.0` 的概念結構，省略型別表、常數池與 value 宣告：
 
 ```text
-%0 : double = param a
-%1 : double = constant 0x0p+0
-%2 : bool = ge %0, %1
-%5 : double = select %2 {
+%zero = constant #zero
+%condition = ge %a, %zero
+%result = if %condition {
   then {
-    %3 : double = call @dsl_math::sqrt(%0)
-    yield %3
+    %root = sqrt %a
+    yield %root
   }
   else {
-    %4 : double = constant 0x0p+0
-    yield %4
+    yield %zero
   }
 }
-return %5
+return_success %result
 ```
 
-每個函數的所有值仍存放在自己的 values 表，但 codegen 依 region 遍歷，不再把整張表從頭到尾無條件執行。分支中的值只在該分支內生成；對外使用的是 `Select` 的結果。
+Value 的型別表與 operation 執行序列分開；codegen 依 region 生成，不能把所有 values 無條件執行。詳見 [IR 架構](ir-architecture.md)。
 
 ### Codegen
 
-`Call` 生成實體 `dsl_math::` API 呼叫或 DSL helper 呼叫，比較生成 bool 暫存值。`Select` 生成立即呼叫的 lambda，內部用 if／else 執行被選中的 region 並回傳結果：
+C++ backend 將 Sqrt 映射到實體 `dsl_math::sqrt`，比較生成 bool 暫存值。If 的結果使用區域變數接收各分支 Yield，例如：
 
 ```cpp
-const double v5 = [&]() -> double {
-    if (v2) {
-        const double v3 = dsl_math::sqrt(v0);
-        return v3;
-    } else {
-        const double v4 = 0x0p+0;
-        return v4;
-    }
-}();
+double selected{};
+if (condition) {
+    const double root = dsl_math::sqrt(a);
+    selected = root;
+} else {
+    selected = 0.0;
+}
 ```
 
-這個 lambda 是從結構化 IR 生成的 C++，不是開放使用者在 DSL 裡寫 lambda 或 if。仍需使用 `-fno-fast-math -ffp-contract=off`，並遵守原有浮點環境前提。
+這是 backend 生成結構的示意；source scalar DSL 仍使用 `?:`。生成結果需用 `-fno-fast-math -ffp-contract=off` 編譯，遵守原有浮點環境前提。未來 backend 可自行 lowering 同一個 Sqrt opcode，不需要知道 C++ runtime header。
 
 ## 驗證方式
 

@@ -2,7 +2,7 @@
 #include "dsl/config.h"
 #include "dsl/frontend.h"
 #include "dsl/ir.h"
-#include "dsl/objects.h"
+#include "dsl/verify.h"
 
 #include <clang/Basic/Version.h>
 #include <llvm/ADT/StringRef.h>
@@ -202,18 +202,15 @@ int main(int argc, char **argv) {
                                 .contextFunctions = contextFunctions,
                                 .objects = objects});
     if (!module)
-        return 1;
-    if (objects) {
-        auto lowered = dsl::lowerObjects(std::move(*module));
-        if (!lowered)
-            return fail(lowered.error());
-        module = std::move(*lowered);
-    }
-    if (const auto saved = writeOutput(output, objects ? dsl::generateObjects(*module)
-                                                       : dsl::generateCpp(*module));
-        !saved)
+        return fail(module.error());
+    if (auto verified = dsl::ir::verify(module->computation); !verified)
+        return fail(verified.error());
+    auto generated = dsl::cpp::generate(*module);
+    if (!generated)
+        return fail(generated.error());
+    if (const auto saved = writeOutput(output, *generated); !saved)
         return fail(saved.error());
     if (dumpIR)
-        std::print("{}", dsl::formatIR(*module));
+        std::print("{}", dsl::ir::format(module->computation));
     return 0;
 }

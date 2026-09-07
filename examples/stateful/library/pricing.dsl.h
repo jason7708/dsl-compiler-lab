@@ -5,10 +5,6 @@ struct Quote {
     double mid;
     double spread;
 };
-struct Ledger {
-    double total;
-    double count;
-};
 struct Totals {
     double total;
     double average;
@@ -26,11 +22,16 @@ Quote read_quote(MarketEvent event) {
     return Quote{.mid = (bid + ask) / 2, .spread = ask - bid};
 }
 
-Totals accumulate_value(double value, Ledger& state) {
-    state.total = state.total + value;
-    state.count = state.count + 1.0;
-    if (state.total > 250.0) {
-        throw CalcError{.code = 2};
+struct accumulate_value {
+    double total = 0.0;
+    double count = 0.0;
+
+    Totals operator()(double value) {
+        total = total + value;
+        count = count + 1.0;
+        if (total > 250.0) {
+            throw CalcError{.code = 2};
+        }
+        return Totals{.total = total, .average = total / count};
     }
-    return Totals{.total = state.total, .average = state.total / state.count};
-}
+};

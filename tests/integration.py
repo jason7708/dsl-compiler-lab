@@ -247,14 +247,23 @@ class Integration(unittest.TestCase):
         self.assert_ok(self.compile_dsl((ARGS.examples / "average.dsl.cpp").read_text()))
         ir = run(ARGS.dslc, self.source, "--dump-ir", "-o", self.output)
         self.assert_ok(ir)
-        self.assertEqual(ir.stdout, """func @compute -> double {
-  %0 : double = param a
-  %1 : double = param b
-  %2 : double = add %0, %1
-  %3 : double = ref %2 (sum)
-  %4 : double = constant 0x1p-1
-  %5 : double = mul %3, %4
-  return %5
+        self.assertEqual(ir.stdout, """computation_ir v1
+type !0 = ieee754.binary64
+type !1 = bool
+type !2 = i32
+constant #c0 : !0 = bits 0x3fe0000000000000
+func @compute ( %0: !0 %1: !0 ) -> ( !0 ) {
+  value %0 : !0
+  value %1 : !0
+  value %2 : !0
+  value %3 : !0
+  value %4 : !0
+  value %5 : !0
+  %2 = add %0, %1
+  %3 = identity %2
+  %4 = constant #c0
+  %5 = mul %3, %4
+  return_success %5
 }
 """)
         self.assertNotIn("sum", self.output.read_text())
@@ -350,8 +359,9 @@ double compute(double x) { return helper(x); }
         result = run(ARGS.dslc, self.source, "--extern-header", cpp_header,
                      "--extern-header", c_header, "--dump-ir", "-o", self.output)
         self.assert_ok(result)
-        self.assertIn("call @vendor::math::offset", result.stdout)
-        self.assertIn("call @native_scale", result.stdout)
+        self.assertIn("external @external1 // vendor::math::offset", result.stdout)
+        self.assertIn("external_call %1, %2 @external1", result.stdout)
+        self.assertIn("external @external0 // native_scale", result.stdout)
         generated = self.output.read_text()
         self.assertIn("::vendor::math::offset(", generated)
         self.assertIn(str(cpp_header), generated)
@@ -503,8 +513,8 @@ int main() { return dsl_math::sqrt(9.0) == 3.0 && dsl_math::pow(2.0, 3.0) == 8.0
     def test_math_example(self):
         result = self.compile_dsl((ARGS.examples / "math.dsl.cpp").read_text())
         self.assert_ok(result)
-        self.assertIn("call @dsl_math::sqrt", result.stdout)
-        self.assertIn("select %", result.stdout)
+        self.assertIn(" = sqrt %", result.stdout)
+        self.assertIn(" = if %", result.stdout)
         executable = self.root / "math-example"
         self.assert_ok(compile_cpp("-std=c++23", "-O2", "-fno-fast-math", "-ffp-contract=off",
                            self.output, ARGS.examples / "math_driver.cpp", "-o", executable))
@@ -523,7 +533,7 @@ int main() { return dsl_math::sqrt(9.0) == 3.0 && dsl_math::pow(2.0, 3.0) == 8.0
             with self.subTest(name=name):
                 result = self.compile_dsl(function(body))
                 self.assert_ok(result)
-                self.assertIn("select %", result.stdout)
+                self.assertIn(" = if %", result.stdout)
                 self.assertIn("yield %", result.stdout)
                 driver = self.root / "lazy.cpp"
                 driver.write_text(f"""

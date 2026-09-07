@@ -1,17 +1,26 @@
 # DSL compiler lab
 
-獨立的 C++ DSL compiler 原型：由 **Clang LibTooling** 解析合法 C++ 的受限子集，檢查 DSL 規則，建立自訂 typed IR，再從 IR 生成 C++23。生成結果交給一般 C++ compiler 編譯，這個工具本身不執行 kernel。
+沒有 compiler 背景的讀者，建議先讀 [從零理解這個 DSL compiler](docs/compiler-from-zero.md)：以實際範例逐步說明各層，並對照 Clang／LLVM。
+
+獨立的 C++ DSL compiler 原型：由 **Clang LibTooling** 解析合法 C++ 的受限子集，檢查 DSL 規則，建立 backend 共用的 typed computation IR，經獨立 verifier 檢查後生成 C++23。C++ linkage、host/context binding 與 unit envelope 各自保存為 metadata。生成結果交給一般 C++ compiler 編譯，這個工具本身不執行 kernel。
 
 ```mermaid
 flowchart LR
     Source[DSL / C++ 原始檔] --> Tokens[Clang Lexer 語法入口檢查]
     Tokens --> AST[Clang AST]
     AST --> Rules[DSL 規則檢查及 lowering]
-    Rules --> IR[Typed IR]
-    IR --> CPP[C++ codegen]
+    Rules --> IR[Computation IR]
+    Rules --> Metadata[Linkage / host binding / unit metadata]
+    IR --> Verify[獨立 IR verifier]
+    Verify --> CPP[C++ codegen]
+    Metadata --> CPP
     CPP --> Compiler[一般 C++ compiler]
     Compiler --> Program[可執行程式]
 ```
+
+IR 重構、型別／OP／state 值流及未來 backend 的界線見 [IR 架構文件](docs/ir-architecture.md)。共用 IR 與 C++ backend 可獨立建置，不依賴 LLVM／Clang。
+
+目前已知問題、修正狀態與後續順序見 [架構工作紀錄](docs/roadmap.md)。
 
 ## Function object 與計算 library
 
@@ -34,7 +43,21 @@ dsl_runtime::unit<price_difference> calculation;
 auto result = calculation.on_event(ctx, event);
 ```
 
-也可以直接傳入自行準備的 context，完全不呼叫外部 provider。Object 模式已支援 `if/else`、`&&/||/!`、early return、區域賦值、flat record result、明確的 `State&` 與 typed error。DSL 的 `throw Error{...}` 生成 `std::unexpected`，`unit` 僅在整次計算成功時提交 state。Intent 仍為空型別，暫不加入路由語意。
+也可以直接傳入自行準備的 context，完全不呼叫外部 provider。Object 模式已支援 `if/else`、`&&/||/!`、early return、區域賦值、flat record result、以 struct 成員表達的 state 與 typed error。DSL 的 `throw Error{...}` 生成 `std::unexpected`，`unit` 僅在整次計算成功時提交 state。Intent 已移除；計算依賴與條件由呼叫 graph 表達，外部交付由 host 處理。
+
+Stateful DSL 使用普通 C++ function object：
+
+```cpp
+struct Accumulator {
+    double total = 0.0;
+    double operator()(double value) {
+        total = total + value;
+        return total;
+    }
+};
+```
+
+父計算宣告 `Accumulator accumulator;` 成員即可持久組合。同一成員多次呼叫共用狀態，不同成員獨立；函數內的 local instance 每次重新建立。舊 `State&` 參數寫法已移除，既有生成 header 需重新生成。
 
 Library 可附 JSON 設定供新作者匯入，省去逐一登記依賴：
 
@@ -43,7 +66,7 @@ build/dslc examples/stateful/accumulate.dsl.cpp \
   --config examples/stateful/project.json -o build/accumulate.generated.h
 ```
 
-完整規則見 [function objects](docs/function-objects.md)、[state／error 與可執行範例](docs/state-and-errors.md)、[library 設定](docs/library-config.md)。目前仍不支援迴圈、陣列、整數算術、任意數值轉型或獨立巢狀 state；硬體 backend 尚未實作。
+完整規則見 [function objects](docs/function-objects.md)、[state／error 與可執行範例](docs/state-and-errors.md)、[library 設定](docs/library-config.md)。目前仍不支援迴圈、陣列、整數算術、任意數值轉型或一般資料 record 成員；硬體 backend 尚未實作。
 
 ## 依賴與固定版本
 
@@ -90,6 +113,17 @@ build/dslc --version
 ```
 
 這兩項與 `LLVM_DIR` 必須指向同一 LLVM／Clang release。CMake 直接尋找 LibTooling 標頭及 `clang-cpp`，不要求整組 Clang 靜態 library targets。停用測試可加 `-DBUILD_TESTING=OFF`。
+
+僅建置共用 IR、C++ backend 與直接 API 測試，可完全略過 LLVM／Clang：
+
+```sh
+cmake -S . -B build-core -G Ninja -DDSL_BUILD_COMPILER=OFF \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc
+cmake --build build-core -j2
+ctest --test-dir build-core --output-on-failure
+```
+
+此模式不建立 DSL CLI 或 runtime；未來 backend 可以只 link `dsl_ir`。
 
 ## 執行驗收範例
 
@@ -163,41 +197,34 @@ input.cpp:2:14: error: DSL: implicit conversions are not supported; use double l
 
 ## AST → IR → C++
 
-驗收範例的 `FunctionDecl` 包含 `a`、`b` 兩個 `ParmVarDecl`，body 裡有 `sum` 的 `VarDecl` 與 `ReturnStmt`。
-
-1. 參數建立 `%0`、`%1`，型別都為 `double`。
-2. `sum` initializer 的 `BinaryOperator(+)` 降成 `%2 = add %0, %1`。Clang 的 `LValueToRValue` 隱式 cast 僅表示讀值，lowering 會移除；C++23 回傳變數時另有不改變型別和值的 `NoOp` 隱式節點，也會移除；其他隱式轉型拒絕；bool 的一般讀值也可移除。
-3. `sum` 綁定為 `%3 = ref %2`；之後的 `DeclRefExpr(sum)` 引用 `%3`。
-4. `FloatingLiteral(0.5)` 降成 `%4`。常數以 double 值存於 IR，序列化為精確的十六進位 `0x1p-1`，不複製來源字面文字。
-5. `BinaryOperator(*)` 降成 `%5 = mul %3, %4`，`ReturnStmt` 指向 `%5`。
-
-完整 IR：
+Clang 解析優先序與名稱綁定；frontend 將來源表示轉成共用 IR。驗收範例的核心是 `add → identity → mul → return_success`，常數池保存 `0.5` 的精確 binary64 bits。
 
 ```text
-func @compute -> double {
-  %0 : double = param a
-  %1 : double = param b
-  %2 : double = add %0, %1
-  %3 : double = ref %2 (sum)
-  %4 : double = constant 0x1p-1
-  %5 : double = mul %3, %4
-  return %5
+computation_ir v1
+type !0 = ieee754.binary64
+type !1 = bool
+type !2 = i32
+constant #c0 : !0 = bits 0x3fe0000000000000
+func @compute ( %0: !0 %1: !0 ) -> ( !0 ) {
+  value %0 : !0
+  value %1 : !0
+  value %2 : !0
+  value %3 : !0
+  value %4 : !0
+  value %5 : !0
+  %2 = add %0, %1
+  %3 = identity %2
+  %4 = constant #c0
+  %5 = mul %3, %4
+  return_success %5
 }
 ```
 
-IR 的 value ID 就是 `values` vector 的索引；每個值都有 `Type::Double` 或 `Type::Bool`。`Region` 指定執行序列及結果，`Function::body.result` 指定回傳值；`Select` 的兩個 region 只執行其中之一。括號不需要獨立 IR 節點，Clang 已把優先序與括號轉成 AST 的樹狀結構，lowering 保留該結構。
+ValueId 與 OperationId 分離；型別透過 TypeId 表達。數學、call、record 與 control 都使用同一套 registered OP。Region 以 ReturnSuccess、ReturnError、Yield 或 Unreachable 結束，不把 statement 包成假的 double 值。
 
-Codegen **只接收 Module IR**，沒有 Clang AST 或輸入原始碼的存取權。它用 value ID 生成安全的名稱，每個 IR 指令產生一個 `const double` 敘述：
+State 更新以不可變 record 值流表達；C++ backend 自行選擇區域副本、tuple、expected 與 wrapper。Core 不含 C++ header、symbol linkage 或 unit 提交操作。`compile()` 與 `cpp::generate()` 都會呼叫獨立 verifier；backend 再檢查 target capability 與 metadata。
 
-```cpp
-double compute(double v0, double v1) {
-    const double v2 = (v0 + v1);
-    const double v3 = v2;
-    const double v4 = 0x1p-1;
-    const double v5 = (v3 * v4);
-    return v5;
-}
-```
+`--dump-ir` 已改為以上格式，尚不提供 dump 載入或序列化。完整資料模型、source planning 與多 backend 邊界見 [IR 架構](docs/ir-architecture.md)。
 
 ## 浮點語意與測試
 
@@ -205,7 +232,7 @@ IR 不做常數折疊、代數化簡、重排或其他最佳化。運算依 AST 
 
 **生成結果需以 `-fno-fast-math -ffp-contract=off` 編譯**，避免一般 C++ compiler 重結合運算或將乘加收縮成 FMA。這個原型以 IEEE-754 binary64、一般預設浮點環境為前提，沒有跨平台 extended precision 或動態 rounding mode 的保證。執行時的除零、Inf／NaN 等遵循一般 double 運算，不另外插入檢查。
 
-CTest 會執行真實 CLI，再用設定的 host C++ compiler 在 `-O2` 下編譯生成結果及原始 C++ reference，執行並逐位元比較，也檢查已知預期值。包含 58 組運算案例及 9 組多函數案例，涵蓋：
+CTest 包含獨立 IR verifier 與 backend API 測試，也會執行真實 CLI，再用設定的 host C++ compiler 在 `-O2` 下編譯生成結果及原始 C++ reference，執行並逐位元比較，也檢查已知預期值。包含 58 組運算案例及 9 組多函數案例，涵蓋：
 
 - 驗收範例、四則運算優先序、括號、減法與除法結合方向、區域變數及名稱碰撞，以及 C++23 直接／括號回傳變數的 AST 差異。
 - 對浮點重結合與 FMA 敏感的輸入、負零、最小 subnormal、最大有限 double、常數精度。
@@ -220,29 +247,28 @@ CTest 會執行真實 CLI，再用設定的 host C++ compiler 在 `-O2` 下編�
 | --- | --- |
 | `std::expected<T, std::string>` | CLI 參數解析、檔案輸出明確回傳成功值或錯誤原因。 |
 | `std::span`、`std::string_view` | 以非擁有的 view 讀取 argv 和原始碼，減少複製與手動索引。 |
-| `std::visit` + 明確列出的 overloads | IR 顯示與 codegen 處理每一種 operation；新增 variant alternative 而未補上處理時會編譯失敗。 |
+| 強型別 ID、`std::variant` | 防止不同 ID 混用，讓型別、attribute 與 terminator 採互斥表示。 |
 | `std::views::enumerate` + structured bindings | 同時取得 value ID 與值引用，移除重複的索引迴圈。 |
 | `std::format`、`std::print` | 格式化診斷、IR 與生成程式；浮點常數以精確十六進位格式輸出。 |
 | RAII `OutputFile` | 將 LLVM 暫存檔的 keep／discard 規則集中管理，失敗離開作用域時自動清理。 |
 | `[[nodiscard]]`、designated initializers | 標示需檢查的結果，讓 IR 建構時各欄位的用途明確。 |
 
-`formatIR(Module)` 與 `generateCpp(Module)` 直接回傳字串，呼叫端負責輸出。`compile()` 保留 `std::optional<Module>`，因為帶有位置的診斷已由 Clang 發出。AST 指標是 Clang 擁有物件的非擁有引用；保留 `llvm::dyn_cast` 以配合 Clang 的節點模型。
+`ir::format(Module)` 回傳除錯字串；`compile()` 與 `cpp::generate(Program)` 使用 `std::expected` 回傳結果或錯誤。AST 指標是 Clang 擁有物件的非擁有引用；保留 `llvm::dyn_cast` 以配合 Clang 的節點模型。
 
-生成的 kernel 使用明確的 `double` 參數與逐步 `const double` 計算，這與 C++23 相容，也方便檢查每一步浮點運算。它不需要 compiler 自身使用的格式化或 ranges 函式庫。
+生成的 C++ 使用逐步 scalar／record 計算。Tuple、lambda 與 expected 是 backend 的多結果／return／error 實作，並非共用 IR 的資料模型。
 
 ## 建議閱讀順序與模組責任
 
-1. [include/dsl/ir.h](include/dsl/ir.h)：最小 typed IR，參數、常數、運算、值引用與 return 的資料表示。
-2. [src/frontend.cpp](src/frontend.cpp)：Clang lexer／巨集檢查、AST 規則驗證、declaration 綁定及 lowering。
-3. [src/codegen.cpp](src/codegen.cpp)：純 IR → C++，可直接對照上面的驗收範例。
-4. [src/ir.cpp](src/ir.cpp)：使用 visitor 格式化 IR、型別與運算名稱、精確浮點常數輸出。
-5. [src/main.cpp](src/main.cpp)：CLI、輸入讀取、錯誤碼與輸出檔替換。
-6. [include/dsl/math.h](include/dsl/math.h)：數學 API metadata，供實體 header 的 AST 驗證與 runtime 呼叫 codegen 使用。
-7. [runtime/include/dsl_runtime/math.h](runtime/include/dsl_runtime/math.h)、[runtime/src/math.cpp](runtime/src/math.cpp)：實體數學 library 的公開 API 與實作。
-8. [src/objects.cpp](src/objects.cpp)、[runtime/include/dsl_runtime/operation.h](runtime/include/dsl_runtime/operation.h)：Object lowering／codegen 與 contract／unit。
-9. [src/config.cpp](src/config.cpp)：JSON library 設定與相對路徑、imports 驗證。
-10. [tests/objects.py](tests/objects.py)：Object、library 與 context binding 的端到端驗證。
-10. [tests/integration.py](tests/integration.py)：語言邊界、浮點運算與端到端驗證。
+1. [IR 架構文件](docs/ir-architecture.md)、[ir.h](include/dsl/ir.h)：共用型別、值、OP、region 與 terminator。
+2. [registry.cpp](src/registry.cpp)、[verify.cpp](src/verify.cpp)：OP 契約、effect 分類與獨立驗證。
+3. [program.h](include/dsl/program.h)：C++ linkage、host binding、unit envelope 的分工。
+4. [semantic.cpp](src/semantic.cpp)：來源表示轉為共用 IR，消除 source mutation。
+5. [frontend.cpp](src/frontend.cpp)、[frontend_bindings.cpp](src/frontend_bindings.cpp)：Clang 規則、context 與呼叫分析；[frontend_ir.h](src/frontend_ir.h) 僅供 frontend 內部使用。
+6. [codegen.cpp](src/codegen.cpp)：已驗證的核心與 metadata → C++23。
+7. [main.cpp](src/main.cpp)、[config.cpp](src/config.cpp)：CLI、JSON 設定與完整輸出檔交付。
+8. [math.h](runtime/include/dsl_runtime/math.h)、[math.cpp](runtime/src/math.cpp)、[operation.h](runtime/include/dsl_runtime/operation.h)：實體 runtime 與 contract／unit。
+9. [ir_verifier.cpp](tests/ir_verifier.cpp)、[backend.cpp](tests/backend.cpp)：不依賴 Clang 的直接 API 測試。
+10. [integration.py](tests/integration.py)、[objects.py](tests/objects.py)：語言邊界與生成碼端到端驗證。
 
 沒有加入 LLVM IR、MLIR、JIT、Python binding 或 FPGA 後端。Object 模式的函數展開用於建立完整 context 需求；尚未加入一般最佳化 pipeline。
 

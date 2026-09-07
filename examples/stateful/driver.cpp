@@ -15,7 +15,7 @@ double get_ask(int) {
 }
 
 int main() {
-    dsl_runtime::unit<accumulate_mid> calculation(Ledger{0.0, 0.0});
+    dsl_runtime::unit<accumulate_mid> calculation;
     const MarketEvent event{.instrument_id = 7, .enabled = true};
     const auto first = calculation.on_event(prepare_accumulate_mid_context(event), event);
     if (!first || first->result.total != 102.0)
@@ -26,14 +26,16 @@ int main() {
     std::println("total = {}, average = {}", second->result.total, second->result.average);
 
     const auto failed = calculation.on_event(prepare_accumulate_mid_context(event), event);
-    if (failed || failed.error().code != 2 || calculation.state().total != 204.0 ||
-        calculation.state().count != 2.0)
+    if (failed || failed.error().code != 2 || calculation.state().accumulator_total != 204.0 ||
+        calculation.state().accumulator_count != 2.0)
         return 3;
-    std::println("error = {}, retained total = {}", failed.error().code, calculation.state().total);
+    std::println("error = {}, retained total = {}", failed.error().code,
+                 calculation.state().accumulator_total);
 
     market_ask = 99.0;
     const auto invalid = calculation.on_event(prepare_accumulate_mid_context(event), event);
-    if (invalid || invalid.error().code != 1 || calculation.state().total != 204.0 || reads != 8)
+    if (invalid || invalid.error().code != 1 || calculation.state().accumulator_total != 204.0 ||
+        reads != 8)
         return 4;
     std::println("invalid quote = {}, provider reads = {}", invalid.error().code, reads);
 }

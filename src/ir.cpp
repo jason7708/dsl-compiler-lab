@@ -1,247 +1,103 @@
 #include "dsl/ir.h"
-#include "dsl/math.h"
-#include "dsl/visit.h"
-
-#include <algorithm>
-#include <cmath>
+#include "dsl/registry.h"
 #include <format>
-#include <stdexcept>
-
-namespace dsl {
-std::string_view typeName(Type type) {
-    switch (type) {
-    case Type::Double:
-        return "double";
-    case Type::Bool:
-        return "bool";
-    case Type::Int:
-        return "int";
-    case Type::Record:
-        return "record";
-    }
-    throw std::logic_error("invalid IR type");
-}
-std::string_view opName(BinaryOp op) {
-    switch (op) {
-    case BinaryOp::Add:
-        return "add";
-    case BinaryOp::Subtract:
-        return "sub";
-    case BinaryOp::Multiply:
-        return "mul";
-    case BinaryOp::Divide:
-        return "div";
-    case BinaryOp::Less:
-        return "lt";
-    case BinaryOp::LessEqual:
-        return "le";
-    case BinaryOp::Greater:
-        return "gt";
-    case BinaryOp::GreaterEqual:
-        return "ge";
-    case BinaryOp::Equal:
-        return "eq";
-    case BinaryOp::NotEqual:
-        return "ne";
-    }
-    throw std::logic_error("invalid IR operator");
-}
-std::string_view opSymbol(BinaryOp op) {
-    switch (op) {
-    case BinaryOp::Add:
-        return "+";
-    case BinaryOp::Subtract:
-        return "-";
-    case BinaryOp::Multiply:
-        return "*";
-    case BinaryOp::Divide:
-        return "/";
-    case BinaryOp::Less:
-        return "<";
-    case BinaryOp::LessEqual:
-        return "<=";
-    case BinaryOp::Greater:
-        return ">";
-    case BinaryOp::GreaterEqual:
-        return ">=";
-    case BinaryOp::Equal:
-        return "==";
-    case BinaryOp::NotEqual:
-        return "!=";
-    }
-    throw std::logic_error("invalid IR operator");
-}
-std::string_view opName(UnaryOp op) {
-    switch (op) {
-    case UnaryOp::Plus:
-        return "pos";
-    case UnaryOp::Negate:
-        return "neg";
-    case UnaryOp::Not:
-        return "not";
-    }
-    throw std::logic_error("invalid IR operator");
-}
-char opSymbol(UnaryOp op) {
-    switch (op) {
-    case UnaryOp::Plus:
-        return '+';
-    case UnaryOp::Negate:
-        return '-';
-    case UnaryOp::Not:
-        return '!';
-    }
-    throw std::logic_error("invalid IR operator");
-}
-const MathBuiltin &mathBuiltin(MathFunction function) {
-    const auto builtin = std::ranges::find(mathBuiltins, function, &MathBuiltin::function);
-    if (builtin == mathBuiltins.end())
-        throw std::logic_error("invalid math function");
-    return *builtin;
-}
-std::optional<MathFunction> findMathBuiltin(std::string_view name) {
-    const auto builtin = std::ranges::find(mathBuiltins, name, &MathBuiltin::name);
-    if (builtin == mathBuiltins.end())
-        return std::nullopt;
-    return builtin->function;
-}
-std::string doubleLiteral(double value) {
-    return std::format("{}0x{:a}", std::signbit(value) ? "-" : "", std::abs(value));
-}
+namespace dsl::ir {
 namespace {
-std::string formatRegion(const Module &module, const Function &function, const Region &region,
-                         const std::string &indent, std::string_view terminator) {
-    std::string text;
-    for (const auto id : region.instructions) {
-        const auto &value = function.values[id];
-        const auto operation = std::visit(
-            Overloaded{
-                [](const Parameter &parameter) {
-                    return parameter.recordName.empty()
-                               ? std::format("param {}", parameter.name)
-                               : std::format("param {} ({})", parameter.name, parameter.recordName);
-                },
-                [](const IntegerConstant &constant) {
-                    return std::format("constant {}", constant.value);
-                },
-                [](const Member &member) {
-                    return std::format("member %{}.{}", member.base, member.field);
-                },
-                [&](const ContextRead &read) {
-                    std::string arguments;
-                    for (const auto argument : read.arguments) {
-                        if (!arguments.empty())
-                            arguments += ", ";
-                        arguments += std::format("%{}", argument);
-                    }
-                    return std::format("context {} <- @{}({})", read.field,
-                                       module.externals[read.external].name, arguments);
-                },
-                [](const Constant &constant) {
-                    return std::format("constant {}", doubleLiteral(constant.value));
-                },
-                [](const BooleanConstant &constant) {
-                    return std::format("constant {}", constant.value);
-                },
-                [](const Binary &binary) {
-                    return std::format("{} %{}, %{}", opName(binary.op), binary.lhs, binary.rhs);
-                },
-                [](const Unary &unary) {
-                    return std::format("{} %{}", opName(unary.op), unary.operand);
-                },
-                [](const Reference &reference) {
-                    return std::format("ref %{} ({})", reference.target, reference.name);
-                },
-                [&](const Call &call) {
-                    const auto callee =
-                        std::visit(Overloaded{
-                                       [](MathFunction function) {
-                                           return std::string(mathBuiltin(function).cppName);
-                                       },
-                                       [&](ExternalFunction function) {
-                                           return module.externals[function.id].name;
-                                       },
-                                       [&](DslFunction function) {
-                                           return module.functions[function.id].name;
-                                       },
-                                   },
-                                   call.target);
-                    auto text = std::format("call @{}(", callee);
-                    bool first = true;
-                    for (const auto argument : call.arguments) {
-                        if (!first)
-                            text += ", ";
-                        first = false;
-                        text += std::format("%{}", argument);
-                    }
-                    return text + ')';
-                },
-                [&](const RecordInit &op) {
-                    std::string fields;
-                    for (auto field : op.fields) {
-                        if (!fields.empty())
-                            fields += ", ";
-                        fields += std::format("%{}", field);
-                    }
-                    return "record {" + fields + "}";
-                },
-                [](const Store &op) {
-                    return std::format("store %{} <- %{}", op.target, op.value);
-                },
-                [](const FieldStore &op) {
-                    return std::format("store %{}.{} <- %{}", op.base, op.field, op.value);
-                },
-                [](const StateCopy &op) { return std::format("state_copy %{}", op.source); },
-                [](const Return &op) {
-                    return std::format("{} %{}", op.failure ? "error" : "return", op.value);
-                },
-                [&](const Scope &op) {
-                    return "scope {\n" +
-                           formatRegion(module, function, op.body, indent + "  ", "") + indent +
-                           "}";
-                },
-                [&](const If &op) {
-                    return std::format(
-                        "if %{} {{\n{}{}}} else {{\n{}{}}}", op.condition,
-                        formatRegion(module, function, op.whenTrue, indent + "  ", ""), indent,
-                        formatRegion(module, function, op.whenFalse, indent + "  ", ""), indent);
-                },
-                [&](const Invoke &op) {
-                    return std::format("invoke @{} {{\n{}{}}}", module.functions[op.function].name,
-                                       formatRegion(module, function, op.body, indent + "  ", ""),
-                                       indent);
-                },
-                [&](const Select &select) {
-                    return std::format(
-                        "select %{} {{\n{}  then {{\n{}{}}}\n{}  else {{\n{}{}}}\n{}}}",
-                        select.condition, indent,
-                        formatRegion(module, function, select.whenTrue, indent + "    ", "yield"),
-                        indent + "  ", indent,
-                        formatRegion(module, function, select.whenFalse, indent + "    ", "yield"),
-                        indent + "  ", indent);
-                },
-            },
-            value.operation);
-        text += std::format("{}%{} : {} = {}\n", indent, id, typeName(value.type), operation);
+std::string values(const std::vector<ValueId> &ids) {
+    std::string result;
+    for (auto id : ids) {
+        if (!result.empty())
+            result += ", ";
+        result += std::format("%{}", id.value);
     }
-    if (!terminator.empty())
-        text += std::format("{}{} %{}\n", indent, terminator, region.result);
+    return result;
+}
+std::string region(const Region &body, const std::string &indent) {
+    std::string text;
+    for (const auto &op : body.operations) {
+        const auto *definition = lookup(op.code, registry());
+        text += indent;
+        if (!op.results.empty())
+            text += values(op.results) + " = ";
+        text += definition ? definition->name : "<unknown>";
+        if (!op.operands.empty())
+            text += " " + values(op.operands);
+        if (const auto *id = std::get_if<ConstantId>(&op.attribute))
+            text += std::format(" #c{}", id->value);
+        if (const auto *id = std::get_if<FieldId>(&op.attribute))
+            text += std::format(" #field{}", id->value);
+        if (const auto *id = std::get_if<FunctionId>(&op.attribute))
+            text += std::format(" @f{}", id->value);
+        if (const auto *id = std::get_if<ExternalId>(&op.attribute))
+            text += std::format(" @external{}", id->value);
+        text += '\n';
+        for (const auto &child : op.regions)
+            text += indent + "{\n" + region(child, indent + "  ") + indent + "}\n";
+    }
+    if (!body.terminator)
+        return text + indent + "<missing terminator>\n";
+    if (const auto *t = std::get_if<ReturnSuccess>(&*body.terminator))
+        text += indent + "return_success " + values(t->values) + "\n";
+    else if (const auto *t = std::get_if<ReturnError>(&*body.terminator))
+        text += indent + std::format("return_error %{}\n", t->error.value);
+    else if (const auto *t = std::get_if<Yield>(&*body.terminator))
+        text += indent + "yield " + values(t->values) + "\n";
+    else
+        text += indent + "unreachable\n";
     return text;
 }
 } // namespace
-std::string formatIR(const Module &module) {
-    std::string text;
-    for (const auto &external : module.externals) {
-        std::string parameters;
-        for (std::size_t i = 0; i < external.arity; ++i)
-            parameters += std::format("{}{}", i == 0 ? "" : ", ", typeName(external.parameters[i]));
-        text += std::format("extern @{}({}) -> double\n", external.name, parameters);
+std::string format(const Module &module) {
+    std::string text = "computation_ir v1\n";
+    for (std::size_t i = 0; i < module.types.size(); ++i) {
+        text += std::format("type !{} = ", i);
+        const auto &t = module.types[i];
+        if (std::holds_alternative<BoolType>(t))
+            text += "bool";
+        else if (const auto *integer = std::get_if<IntegerType>(&t))
+            text += std::format("{}{}", integer->signedness == Signedness::Signed ? "i" : "u",
+                                integer->width);
+        else if (const auto *fp = std::get_if<FloatType>(&t))
+            text += fp->format == FloatFormat::IEEE754Binary64 ? "ieee754.binary64"
+                                                               : "ieee754.binary32";
+        else {
+            text += "record {";
+            for (const auto &f : std::get<RecordType>(t).fields)
+                text += std::format(" #{}: !{}", f.id.value, f.type.value);
+            text += " }";
+        }
+        text += '\n';
     }
-    for (const auto &function : module.functions) {
-        text += std::format(
-            "func @{} -> {} {{\n{}}}\n", function.name, typeName(function.returnType),
-            formatRegion(module, function, function.body, "  ", module.objectMode ? "" : "return"));
+    for (std::size_t i = 0; i < module.constants.size(); ++i) {
+        const auto &c = module.constants[i];
+        text += std::format("constant #c{} : !{} = ", i, c.type.value);
+        if (const auto *bits = std::get_if<std::uint64_t>(&c.payload))
+            text += std::format("bits 0x{:x}", *bits);
+        else {
+            text += "{";
+            for (auto id : std::get<std::vector<ConstantId>>(c.payload))
+                text += std::format(" #c{}", id.value);
+            text += " }";
+        }
+        text += '\n';
+    }
+    for (std::size_t i = 0; i < module.externals.size(); ++i)
+        text += std::format("external @external{} // {}\n", i, module.externals[i].debugName);
+    for (const auto &f : module.functions) {
+        text += "func @" + f.debugName + " (";
+        for (auto id : f.parameters)
+            text += std::format(" %{}: !{}", id.value, f.values[id.value].value);
+        text += " ) -> (";
+        for (auto t : f.signature.results)
+            text += std::format(" !{}", t.value);
+        text += " )";
+        if (f.signature.error)
+            text += std::format(" error !{}", f.signature.error->value);
+        text += " {\n";
+        for (std::size_t i = 0; i < f.values.size(); ++i)
+            text += std::format("  value %{} : !{}\n", i, f.values[i].value);
+        text += region(f.body, "  ") + "}\n";
     }
     return text;
 }
-} // namespace dsl
+} // namespace dsl::ir

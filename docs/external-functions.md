@@ -90,18 +90,12 @@ Header 定義的巨集在生成程式 include 完成後會 `#undef`，避免改�
 
 ## AST → IR → C++
 
-1. Frontend 遞迴走訪已登記 header 的 namespace／linkage declaration，檢查函數簽名，建立 canonical declaration → external ID 的表。
-2. `CallTarget` 新增 `ExternalFunction`。Module 保存外部函數的限定名稱、arity，以及實際引入的 header；外部函數沒有 DSL body IR。
-3. 呼叫 lowering 依 Clang 已解析的宣告身分選擇 runtime、DSL 或 external target；參數逐一轉為 double IR 值，不靠函數名字猜測。
-4. Codegen 以限定名稱輸出，例如 `::external_ops::weighted_sum(v0, v1)`。一般 C++ compiler 從真實 header 取得 ABI，由 linker 找到實作。
+1. Frontend 走訪已登記 header 的 namespace／linkage declaration，檢查函數簽名，以 canonical declaration identity 辨識呼叫。
+2. 共用 Module 保存 ExternalId 與邏輯 signature，沒有外部函數 body。限定 C++ symbol、真實 header 及巨集資訊另存在 CppLinkage。
+3. 呼叫轉成 ExternalCall opcode，arguments 是 typed ValueId；verifier 檢查目標、型別、arity 與 error 契約。
+4. C++ backend 由 linkage mapping 生成例如 `::external_ops::weighted_sum(v0, v1)`。Host compiler 從真實 header 取得 ABI，由 linker 找到實作。
 
-IR dump 會顯示：
-
-```text
-extern @external_ops::weighted_sum(double, double) -> double
-```
-
-以及 helper 中的 `call @external_ops::weighted_sum(...)`。
+`--dump-ir` 以 `extern @ext0` 等 ID 顯示邏輯介面，以 `external_call` 顯示呼叫；來源限定名稱只作為除錯標籤。Object 模式登記的 context provider 則抽到 HostBindings，核心透過普通參數取得準備好的資料。完整分層見 [IR 架構](ir-architecture.md)。
 
 外部函數可以有副作用。DSL 表達式按 IR 順序求值，參數由左到右各求值一次；這明確選定了普通 C++ 函數參數求值順序中原本未指定的順序。`?:` 只執行被選中的 region，外部呼叫不會被提前執行，也不假設它是純函數。外部函數內部的浮點環境、副作用和例外行為由其實作決定。
 

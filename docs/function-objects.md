@@ -1,6 +1,6 @@
 # Function object、context binding 與計算 library
 
-`--emit-objects` 將 DSL 函數生成為 C++23 function object，並提供 `context / state / event / result / error / intent` contract、context 準備函數，以及管理 state 的 `unit`。Intent 暫時是空型別，沒有 send、emit 或路由語意。
+`--emit-objects` 將 DSL 函數生成為 C++23 function object，並提供 `context / state / event / result / error` contract、context 準備函數，以及管理 state 的 `unit`。Intent 已移除；計算組合由函數／實例呼叫及分支表達，外部交付由 host 處理。
 
 ## 完整範例
 
@@ -92,11 +92,10 @@ using mid_price_event = ext_event;
 struct mid_price_state {};
 using mid_price_result = double;
 struct mid_price_error {};
-struct mid_price_intent {};
 
 using mid_price_contract = dsl_runtime::contract<
     mid_price_context, mid_price_state, mid_price_event,
-    mid_price_result, mid_price_error, mid_price_intent>;
+    mid_price_result, mid_price_error>;
 using mid_price_output = mid_price_contract::output;
 
 struct mid_price {
@@ -110,7 +109,7 @@ struct mid_price {
 mid_price_context prepare_mid_price_context(const mid_price_event& event);
 ```
 
-`contract_t::output` 的實體結構是 `operation_output<Result, Intent, State>`，包含 `result`、`intent`、`new_state`。生成的 `mid_price_output` 與 contract 使用同一型別，不是兩個形狀相同但互不相容的 struct。`contract_t::response` 為 `std::expected<output, error>`。
+`contract_t::output` 的實體結構是 `operation_output<Result, State>`，包含 `result`、`new_state`。生成的 `mid_price_output` 與 contract 使用同一型別，不是兩個形狀相同但互不相容的 struct。`contract_t::response` 為 `std::expected<output, error>`。
 
 Object 沒有隱藏的可變 state。其 `operator()` 從 context 讀取 bid、ask，從 typed IR 生成計算，最後回傳 output。生成的 binder 則依序呼叫真正的 `get_bid/get_ask`。
 
@@ -158,7 +157,7 @@ return event.enabled ? bid : 0.0;
 
 DSL library 是 compiler 會讀取及驗證的原始碼 library，可以使用 `#pragma once` 與 literal include；不接受 `#define`／條件編譯或巨集展開。外部介面 header 則仍可使用一般 include guard。
 
-Frontend 先建立整個 module 的函數表。Object lowering 在 typed IR 層展開 DSL 呼叫，複製 callee 的值參數，為 state 建立工作副本；每個外部讀取轉成明確的 `ContextRead`。因此 `price_difference` 的 context 會包含它呼叫的 `mid_price` 所需資料，例如：
+Frontend 先建立整個 module 的函數表，在私有 source planning 階段展開 DSL 呼叫並收集外部讀取。Semantic 轉換再將計算降為不可變值流與 Evaluate 邊界，將 ContextRead 改為核心參數，取得方式另保存為 HostBindings。因此 `price_difference` 的 context 會包含它呼叫的 `mid_price` 所需資料，例如：
 
 ```cpp
 struct price_difference_context {
@@ -173,9 +172,11 @@ Object 模式拒絕遞迴／相互遞迴，單一 object 展開上限為 100000 
 
 目前每次輸出是一份包含本 module 所有 objects 的 header bundle。這不是已編譯 DSL binary 的匯入機制；新 DSL 重用的是 `.dsl.h` 原始碼與外部介面登記資訊。生成 header 給一般 C++ 使用，不應再當成 DSL 原始碼 include。多份 bundle 若包含同名 object，應合併來源生成一次，避免重複定義。
 
+公開名稱不衝突的不同 bundle 可以一起 include 或分開編譯後連結。內部函數位於各自的 `dsl_backend::module_<最小 export 名稱>` namespace，不會因 FunctionId 都從 0 開始而互相覆蓋。命名由 export 集合決定，不依賴生成檔路徑；舊生成檔需重新生成。詳細範圍與測試見 [工作紀錄第 1 項](roadmap.md#1-不同生成-library-的名稱與連結隔離)。
+
 ## State、error 與 unit
 
-DSL 可用最後一個 `State& state` 參數宣告持久 state，以 `state.field = value` 更新；`throw Error{...}` 表達 typed error，生成 `std::unexpected`，不產生 C++ throw。回傳值可以是 double、bool、int 或 flat record。沒有宣告時，state／error 仍各自生成空型別。
+DSL 用含 `operator()` 的計算 struct 表達持久 state，scalar 成員與子計算成員歸屬於各自實例；`throw Error{...}` 表達 typed error，生成 `std::unexpected`，不產生 C++ throw。回傳值可以是 double、bool、int 或 flat record。沒有宣告時，state／error 仍各自生成空型別。
 
 [operation.h](../runtime/include/dsl_runtime/operation.h) 的 `unit<Op>` 管理提交：
 
@@ -185,13 +186,13 @@ DSL 可用最後一個 `State& state` 參數宣告持久 state，以 `state.fiel
 - 要求 state 複製指派與 response 移動建構不拋例外，避免提交後的回傳因移動失敗。
 - 同一個 unit 的事件由外部依序調用；沒有內建並行排程或輸出佇列。
 
-DSL helper 的 state／error 會依呼叫鏈組合：成功更新 caller 的工作 state，失敗自動向外傳遞；最外層 unit 成功才提交。現階段整條鏈共用同一種 error record，stateful helper 必須接收 caller 明確的同型別 State&。
+DSL helper 的 state／error 會依呼叫鏈組合：成功產生 caller 的下一個 state 值，失敗自動向外傳遞；最外層 unit 成功才提交。現階段整條鏈共用同一種 error record。子物件各自擁有 state，compiler 將它們攤平；重複呼叫同一成員會共用狀態，local 物件則每次重新建立。
 
 Context binder 直接回傳 context；provider 的 C++ 例外由 host 處理，不自動包成 DSL error。NaN／Inf 也不自動變成 error。具體語法、rollback 測試與完整 library 範例見 [state-and-errors.md](state-and-errors.md)。
 
 ## 支援型別與記憶體
 
-Event、state、result 與 error record 必須是平坦、trivial、standard-layout 的 public struct，欄位只接受 double、bool、32-bit int。拒絕指標、陣列、巢狀 record、繼承、member function、bit-field、欄位初值與其他 modifiers。Frontend 檢查 Clang 目標中的 int 寬度為 32 bits。
+Event、result 與 error record 必須是平坦、trivial、standard-layout 的 public struct，欄位只接受 double、bool、32-bit int。拒絕指標、陣列、巢狀 record、繼承、member function、bit-field、欄位初值與其他 modifiers。Frontend 檢查 Clang 目標中的 int 寬度為 32 bits。計算 struct 可以包含具 literal 初值的 scalar 成員及子計算物件，生成的 state 會攤平；完整規則見 [state-and-errors.md](state-and-errors.md)。
 
 Object 模式支援已初始化的 scalar／record 區域變數、scalar 賦值、local record 欄位更新、if/else、early return 與 bool 短路運算。回傳型別可以是 double、bool、int 或 flat record。允許 double 運算中的 int literal 提升，例如 `/ 2`；一般 int 變數不會隱式轉成 double。另支援 int 對 int 的比較，適合比較 instrument ID；尚未加入整數算術。
 
@@ -204,9 +205,10 @@ Object 模式支援已初始化的 scalar／record 區域變數、scalar 賦值�
 | 檔案 | 責任 |
 | --- | --- |
 | [frontend.cpp](../src/frontend.cpp) | Object 模式的 record、欄位讀取、型別檢查、DSL library 載入與 provider 登記。 |
-| [ir.h](../include/dsl/ir.h) | Record metadata、int／record 型別、Member、ContextRead 與函數資訊。 |
-| [objects.cpp](../src/objects.cpp) | 展開 DSL 呼叫、驗證 context 依賴、產生 binder、contract 與 object。 |
+| [ir.h](../include/dsl/ir.h)、[verify.cpp](../src/verify.cpp) | 共用型別、值流、OP、region／terminator 與獨立驗證。 |
+| [frontend_bindings.cpp](../src/frontend_bindings.cpp)、[semantic.cpp](../src/semantic.cpp) | Frontend 呼叫／context 分析，轉換共用 IR 並拆分 metadata。 |
+| [program.h](../include/dsl/program.h)、[codegen.cpp](../src/codegen.cpp) | C++ linkage、host bindings、unit envelope，以及 binder／contract／object 生成。 |
 | [operation.h](../runtime/include/dsl_runtime/operation.h) | 共用 contract／output 與 unit。 |
 | [objects.py](../tests/objects.py) | 生成碼編譯執行、context 邊界、library 組合及 unit state 驗證。 |
 
-Object codegen 只接收 typed IR，沒有複製 DSL 原始碼作為函數本體。
+C++ backend 只接收共用 IR 與分開的 integration metadata，沒有複製 DSL 原始碼作為函數本體。詳見 [IR 架構](ir-architecture.md)。

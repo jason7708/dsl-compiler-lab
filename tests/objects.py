@@ -65,8 +65,10 @@ double mid_price(ext_event event) {
     def test_binding_and_pure_evaluation(self):
         result = self.compile(self.mid(), '--context-function', 'get_bid', '--context-function', 'get_ask')
         self.ok(result)
-        self.assertIn('context bid <- @get_bid', result.stdout)
-        self.assertIn('context ask <- @get_ask', result.stdout)
+        self.assertIn('func @mid_price ( %0: !3 %1: !0 %2: !0 )', result.stdout)
+        self.assertNotIn('external_call', result.stdout)
+        self.assertIn('double bid;', self.output.read_text())
+        self.assertIn('double ask;', self.output.read_text())
         self.assertIn('using mid_price_event = ::ext_event;', self.output.read_text())
         self.execute('''#include "generated.h"
 #include <type_traits>
@@ -158,13 +160,12 @@ struct Context { double factor; };
 struct State { double total; };
 struct Event { double value; bool valid; };
 enum class Error { invalid };
-struct Intent {};
 struct Accumulate {
-    using contract_t = dsl_runtime::contract<Context, State, Event, double, Error, Intent>;
+    using contract_t = dsl_runtime::contract<Context, State, Event, double, Error>;
     contract_t::response operator()(const Context& ctx, const State& state, const Event& event) const {
         if (!event.valid) return std::unexpected(Error::invalid);
         const auto next = state.total + event.value * ctx.factor;
-        return contract_t::output{next, {}, {next}};
+        return contract_t::output{next, {next}};
     }
 };
 int main() {
@@ -187,6 +188,74 @@ int main() {
 double other();
 int main() { return other() == 9.0 && square{}({}, {}, {2.0})->result == 4.0 ? 0 : 1; }
 ''', other)
+
+    def test_distinct_generated_bundles(self):
+        # Both bundles use local FunctionId 0 with the same C++ signature, but
+        # implement different computations. Public names are deliberately disjoint.
+        for name, expression in [('plus_one', 'x + 1.0'), ('times_two', 'x * 2.0')]:
+            self.ok(self.compile(f'double {name}(double x) {{ return {expression}; }}'))
+            (self.root / f'{name}.h').write_text(self.output.read_text())
+        flags = ['-std=c++23', '-Wall', '-Wextra', '-Werror',
+                 '-fno-fast-math', '-ffp-contract=off', '-I', args.runtime_include]
+        for optimization in ['-O0', '-O2']:
+            for names in [('plus_one', 'times_two'), ('times_two', 'plus_one')]:
+                with self.subTest(mode='same file', optimization=optimization, order=names):
+                    driver = self.root / 'combined.cpp'
+                    driver.write_text(''.join(f'#include "{name}.h"\n' for name in names) + '''
+int main() {
+    return plus_one{}({}, {}, {10.0})->result == 11.0 &&
+           times_two{}({}, {}, {10.0})->result == 20.0 ? 0 : 1;
+}
+''')
+                    executable = self.root / 'combined'
+                    self.ok(run(args.cxx, *flags, optimization, driver,
+                                args.runtime_library, '-o', executable))
+                    self.ok(run(executable))
+
+            objects = []
+            for name in ['plus_one', 'times_two']:
+                source = self.root / f'{name}_user.cpp'
+                source.write_text(f'#include "{name}.h"\n'
+                                  f'double run_{name}() {{ return {name}{{}}({{}}, {{}}, {{10.0}})->result; }}')
+                obj = self.root / f'{name}.o'
+                self.ok(run(args.cxx, *flags, optimization, '-c', source, '-o', obj))
+                objects.append(obj)
+            driver = self.root / 'linked.cpp'
+            driver.write_text('''double run_plus_one();
+double run_times_two();
+int main() { return run_plus_one() == 11.0 && run_times_two() == 20.0 ? 0 : 1; }
+''')
+            for order in [objects, objects[::-1]]:
+                with self.subTest(mode='separate files', optimization=optimization, order=order):
+                    executable = self.root / 'linked'
+                    self.ok(run(args.cxx, *flags, optimization, driver, *order,
+                                args.runtime_library, '-o', executable))
+                    self.ok(run(executable))
+
+    def test_scalar_and_object_bundles_can_link(self):
+        self.ok(self.compile('double plus_one(double x) { return x + 1.0; }'))
+        scalar = self.root / 'scalar.dsl.cpp'
+        scalar.write_text('''double helper(double x) { return x + 3.0; }
+double compute(double x) { return helper(x) * 2.0; }
+''')
+        generated = self.root / 'scalar.cpp'
+        self.ok(run(args.dslc, scalar, '-o', generated))
+        self.execute('''#include "generated.h"
+double compute(double);
+int main() { return compute(10.0) == 26.0 && plus_one{}({}, {}, {10.0})->result == 11.0 ? 0 : 1; }
+''', generated, '-O0')
+
+    def test_bundle_identity_is_independent_of_source_and_output_path(self):
+        source = 'double plus_one(double x) { return x + 1.0; }'
+        self.ok(self.compile(source))
+        expected = self.output.read_text()
+        other = self.root / 'relocated'
+        other.mkdir()
+        relocated = other / 'different-name.dsl.cpp'
+        relocated.write_text(source)
+        output = other / 'other-name.h'
+        self.ok(run(args.dslc, relocated, '--emit-objects', '-o', output))
+        self.assertEqual(output.read_text(), expected)
 
     def test_rejections(self):
         cases = [
@@ -297,20 +366,25 @@ int main() {
     def test_stateful_composition_and_error_rollback(self):
         self.ok(self.compile('''
 struct Event { double price; bool valid; };
-struct State { double total; };
 struct Result { double total; bool positive; };
 struct Error { int code; };
-Result accumulate(Event event, State& state) {
-    if (!event.valid || event.price < 0.0) throw Error{.code = 1};
-    state.total = state.total + event.price;
-    if (state.total > 100.0) throw Error{.code = 2};
-    return Result{state.total, state.total > 0.0};
-}
-Result compose(Event event, State& state) {
-    Result first = accumulate(event, state);
-    if (first.positive && event.valid) return accumulate(event, state);
-    return first;
-}
+struct accumulate {
+    double total = 0.0;
+    Result operator()(Event event) {
+        if (!event.valid || event.price < 0.0) throw Error{.code = 1};
+        total = total + event.price;
+        if (total > 100.0) throw Error{.code = 2};
+        return Result{total, total > 0.0};
+    }
+};
+struct compose {
+    accumulate accumulator;
+    Result operator()(Event event) {
+        Result first = accumulator(event);
+        if (first.positive && event.valid) return accumulator(event);
+        return first;
+    }
+};
 '''))
         self.assertNotIn('throw ', self.output.read_text())
         self.assertIn('std::unexpected', self.output.read_text())
@@ -318,19 +392,19 @@ Result compose(Event event, State& state) {
 #include <type_traits>
 int main() {
     static_assert(std::is_same_v<compose_error, Error>);
-    static_assert(std::is_same_v<compose_state, State>);
-    dsl_runtime::unit<compose> unit(State{0.0}), other(State{40.0});
+    static_assert(sizeof(compose_state) == sizeof(double));
+    dsl_runtime::unit<compose> unit, other(compose_state{40.0});
     auto a = unit.on_event({}, {10.0, true});
-    if (!a || a->result.total != 20.0 || unit.state().total != 20.0) return 1;
+    if (!a || a->result.total != 20.0 || unit.state().accumulator_total != 20.0) return 1;
     auto b = unit.on_event({}, {10.0, false});
-    if (b || b.error().code != 1 || unit.state().total != 20.0) return 2;
+    if (b || b.error().code != 1 || unit.state().accumulator_total != 20.0) return 2;
     // The first child succeeds with 70; the second fails with 120.
     auto c = unit.on_event({}, {50.0, true});
-    if (c || c.error().code != 2 || unit.state().total != 20.0) return 3;
-    const State input{0.0};
+    if (c || c.error().code != 2 || unit.state().accumulator_total != 20.0) return 3;
+    const compose_state input{};
     auto direct = compose{}({}, input, {10.0, true});
-    return direct && direct->new_state.total == 20.0 && input.total == 0.0 &&
-           other.state().total == 40.0 ? 0 : 4;
+    return direct && direct->new_state.accumulator_total == 20.0 && input.accumulator_total == 0.0 &&
+           other.state().accumulator_total == 40.0 ? 0 : 4;
 }
 ''', '-fno-exceptions')
 
@@ -358,23 +432,28 @@ int main() {
 }
 ''', '-fno-exceptions')
 
-    def test_state_and_value_parameter_are_independent(self):
+    def test_local_instances_reset_each_event(self):
         self.ok(self.compile('''
-struct State { double value; };
-double child(State event, State& state) {
-    state.value = state.value + 1.0;
-    return event.value;
-}
-double parent(State& state) {
-    double previous = child(state, state);
-    return previous + state.value;
+struct Child {
+    double value = 2.0;
+    double operator()(double amount) {
+        value = value + amount;
+        return value;
+    }
+};
+double parent() {
+    Child child;
+    double first = child(1.0);
+    return first + child(1.0);
 }
 '''))
         self.execute('''#include "generated.h"
 int main() {
-    dsl_runtime::unit<parent> unit(State{2.0});
-    auto value = unit.on_event({}, {});
-    return value && value->result == 5.0 && unit.state().value == 3.0 ? 0 : 1;
+    dsl_runtime::unit<parent> unit;
+    static_assert(std::is_empty_v<parent_state>);
+    auto first = unit.on_event({}, {});
+    auto second = unit.on_event({}, {});
+    return first && second && first->result == 7.0 && second->result == 7.0 ? 0 : 1;
 }
 ''')
 
@@ -388,10 +467,10 @@ int main() {
             ('scalar error', 'double f() { throw 1; }', 'flat record'),
             ('mixed errors', 'struct E { int code; }; struct F { int code; }; double f(bool b) { if (b) throw E{1}; throw F{2}; }', 'one flat record'),
             ('composed errors', 'struct E { int code; }; struct F { int code; }; double a() { throw E{1}; } double b(bool x) { if(x) throw F{2}; return a(); }', 'share one error'),
-            ('local state argument', 'struct S { double x; }; double a(S& s) { return s.x; } double b() { S s{}; return a(s); }', 'explicit state'),
+            ('local state argument', 'struct S { double x; }; double a(S& s) { return s.x; } double b() { S s{}; return a(s); }', 'struct members'),
             ('reference event', 'struct E { double x; }; double a(const E& e) { return e.x; }', 'parameters'),
             ('mutable context alias', '#include "api.h"\ndouble f(ext_event e) { int id = e.instrument_id; id = 2; return get_bid(id); }', 'context arguments'),
-            ('state context', '#include "api.h"\nstruct S { int id; }; double f(ext_event e, S& s) { return get_bid(s.id); }', 'context arguments'),
+            ('state context', '#include "api.h"\nstruct S { int id = 7; double operator()(ext_event e) { return get_bid(id); } };', 'context arguments'),
             ('read after guard', '#include "api.h"\ndouble f(ext_event e) { if (!e.enabled) return 0.0; return get_bid(e.instrument_id); }', 'possible return/error'),
             ('read after failure', '#include "api.h"\nstruct E { int code; }; double fail(bool x) { if (x) throw E{1}; return 0.0; } double f(ext_event e) { double x = fail(e.enabled); return get_bid(e.instrument_id); }', 'possible return/error'),
         ]
@@ -437,6 +516,187 @@ int main() {
         self.ok(run(args.dslc, example / 'accumulate.dsl.cpp', '--config',
                     example / 'project.json', '-o', self.output))
         self.execute((example / 'driver.cpp').read_text())
+
+    def test_member_instances_match_cpp_ownership(self):
+        source = '''
+struct Accumulator {
+    double total = 5.0;
+    double operator()(double value) { total = total + value; return total; }
+};
+struct Shared {
+    Accumulator accumulator;
+    double operator()(double value) {
+        double first = accumulator(value);
+        return first + accumulator(value * 2.0);
+    }
+};
+struct Separate {
+    Accumulator bid;
+    Accumulator ask{10.0};
+    double operator()(double value) {
+        double first = bid(value);
+        return first + ask(value * 2.0);
+    }
+};
+struct Nested {
+    Shared shared;
+    Separate separate;
+    double operator()(double value) {
+        double a = shared(value);
+        return a + separate(value);
+    }
+};
+'''
+        self.ok(self.compile(source))
+        (self.root / 'reference.h').write_text('namespace reference {\n' + source + '\n}')
+        self.assertNotIn('intent', self.output.read_text())
+        self.execute('''#include "generated.h"
+#include "reference.h"
+#include <type_traits>
+int main() {
+    static_assert(sizeof(Nested_state) == 3 * sizeof(double));
+    static_assert(std::is_empty_v<Nested>);
+    reference::Nested expected;
+    dsl_runtime::unit<Nested> actual, isolated;
+    for (double value : {1.0, 10.0, 2.0}) {
+        auto result = actual.on_event({}, {value});
+        if (!result || result->result != expected(value)) return 1;
+        if (actual.state().shared_accumulator_total != expected.shared.accumulator.total ||
+            actual.state().separate_bid_total != expected.separate.bid.total ||
+            actual.state().separate_ask_total != expected.separate.ask.total) return 2;
+    }
+    return isolated.state().shared_accumulator_total == 5.0 &&
+           isolated.state().separate_ask_total == 10.0 ? 0 : 3;
+}
+''')
+
+    def test_state_initializers_members_and_local_overrides(self):
+        self.ok(self.compile('''
+struct Counter {
+    double total = -2.5;
+    int code = 7;
+    bool enabled = true;
+    double operator()(double value) {
+        if (enabled && code == 7) total = total + value;
+        return total;
+    }
+};
+struct Owner {
+    Counter child{4.0, 7, true};
+    double baseline = 1.0;
+    double operator()(double value) {
+        Counter local{10.0, 7, true};
+        child.total = child.total + baseline;
+        this->baseline = this->baseline + 1.0;
+        double first = child(value);
+        return first + local(value);
+    }
+};
+'''))
+        self.execute('''#include "generated.h"
+int main() {
+    dsl_runtime::unit<Counter> counter;
+    if (counter.state().total != -2.5 || counter.state().code != 7 || !counter.state().enabled) return 1;
+    dsl_runtime::unit<Owner> owner;
+    auto first = owner.on_event({}, {2.0});
+    auto second = owner.on_event({}, {2.0});
+    return first && second && first->result == 19.0 && second->result == 23.0 &&
+           owner.state().baseline == 3.0 && owner.state().child_total == 11.0 ? 0 : 2;
+}
+''')
+
+    def test_conditional_instances_and_atomic_commit(self):
+        self.ok(self.compile('''
+struct Error { int code; };
+struct Accumulator {
+    double total = 0.0;
+    double operator()(double value) {
+        total = total + value;
+        if (total > 20.0) throw Error{2};
+        return total;
+    }
+};
+struct Pair {
+    Accumulator a;
+    Accumulator b;
+    double calls = 0.0;
+    double operator()(double value, bool enabled) {
+        calls = calls + 1.0;
+        a(value);
+        if (enabled) return b(value * 2.0);
+        return a.total;
+    }
+};
+'''))
+        self.execute('''#include "generated.h"
+int main() {
+    dsl_runtime::unit<Pair> unit;
+    auto first = unit.on_event({}, {5.0, false});
+    if (!first || first->result != 5.0 || unit.state().b_total != 0.0) return 1;
+    auto second = unit.on_event({}, {5.0, true});
+    if (!second || second->result != 10.0 || unit.state().a_total != 10.0) return 2;
+    // a succeeds with 20, b fails with 30; neither a nor calls gets committed.
+    auto failed = unit.on_event({}, {10.0, true});
+    return !failed && failed.error().code == 2 && unit.state().a_total == 10.0 &&
+           unit.state().b_total == 10.0 && unit.state().calls == 2.0 ? 0 : 3;
+}
+''', '-fno-exceptions')
+
+    def test_struct_provider_context_and_const_operation(self):
+        self.ok(self.compile('''#include "api.h"
+struct Read {
+    double operator()(ext_event event) const { return get_bid(event.instrument_id); }
+};
+struct Parent {
+    Read reader;
+    double operator()(ext_event event) {
+        double first = reader(event);
+        return first + reader(event);
+    }
+};
+''', '--context-function', 'get_bid'))
+        self.execute('''#include "generated.h"
+int reads = 0;
+double get_bid(int id) { return id + 10.0 * ++reads; }
+int main() {
+    ext_event event{7, 0.0, true};
+    auto ctx = prepare_Parent_context(event);
+    if (reads != 2) return 1;
+    auto a = Parent{}(ctx, {}, event);
+    auto b = Parent{}(ctx, {}, event);
+    return a && b && a->result == 44.0 && b->result == 44.0 && reads == 2 ? 0 : 2;
+}
+''')
+
+    def test_struct_rejections(self):
+        cases = [
+            ('legacy state', 'struct S { double x; }; double f(S& state) { return state.x; }', 'struct members'),
+            ('missing default', 'struct A { double x; double operator()() { return x; } };', 'initializers'),
+            ('computed default', 'struct A { double x = 1.0 + 2.0; double operator()() { return x; } };', 'literal initializers'),
+            ('multiple operators', 'struct A { double operator()() { return 1.0; } double operator()(double x) { return x; } };', 'exactly one'),
+            ('other method', 'struct A { double helper() { return 1.0; } double operator()() { return helper(); } };', 'exactly one'),
+            ('constructor', 'struct A { A() {} double operator()() { return 1.0; } };', 'constructors'),
+            ('static data', 'struct A { static double x; double operator()() { return x; } };', 'unsupported'),
+            ('mutable data', 'struct A { mutable double x = 0.0; double operator()() { return x; } };', 'unsupported'),
+            ('pointer', 'struct A { double* x; double operator()() { return 0.0; } };', 'initializers'),
+            ('record data', 'struct E { double x; }; struct A { E e{0.0}; double operator()() { return e.x; } };', 'scalar values'),
+            ('generated collision', 'struct A_state { double x; }; struct A { double operator()() { return 1.0; } };', 'conflicts'),
+            ('flattened collision', 'struct B { double x = 0.0; double operator()() { return x; } }; struct A { B b; double b_x = 0.0; double operator()() { return b(); } };', 'collision'),
+            ('copy instance', 'struct A { double operator()() { return 1.0; } }; double f() { A a; A b = a; return b(); }', 'aggregate or default'),
+            ('temporary call', 'struct A { double operator()() { return 1.0; } }; double f() { return A{}(); }', 'named member or local'),
+            ('computation event', 'struct A { double operator()() { return 1.0; } }; double f(A a) { return a(); }', 'parameters'),
+            ('conditional provider', '#include "api.h"\nstruct A { double operator()(ext_event e) { return get_bid(e.instrument_id); } }; struct B { A a; double operator()(ext_event e) { if (e.enabled) return a(e); return 0.0; } };', 'conditional'),
+            ('state provider argument', '#include "api.h"\nstruct A { int id = 7; double operator()() { return get_bid(id); } };', 'context arguments'),
+        ]
+        for label, source, reason in cases:
+            with self.subTest(label=label):
+                self.output.write_text('preserved')
+                options = ('--context-function', 'get_bid') if '#include' in source else ()
+                result = self.compile(source, *options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(reason, result.stderr)
+                self.assertRegex(result.stderr, r':\d+:\d+: error:')
+                self.assertEqual(self.output.read_text(), 'preserved')
 
     def test_config_diagnostics(self):
         config = self.root / 'project.json'
