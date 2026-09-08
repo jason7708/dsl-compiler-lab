@@ -242,6 +242,49 @@ int main() {
                     OperationId{0}, OpCode::Insert, {{0}, {1}}, {{2}}, FieldId{1}, {}, "insert"};
             },
             "insert field type");
+        bad(
+            "operator source diagnostic", arithmetic(),
+            [](Module &m) {
+                auto &op = m.functions[0].body.operations[0];
+                op.location = "user.dsl.cpp:8:19";
+                op.operands[0] = {99};
+            },
+            "add op #0 at user.dsl.cpp:8:19");
+        bad(
+            "nested operator source diagnostic", branches(),
+            [](Module &m) {
+                auto &op = m.functions[0].body.operations[1].regions[0].operations[0];
+                op.location = "helper.dsl.h:12:9";
+                op.operands[0] = {99};
+            },
+            "add op #1 at helper.dsl.h:12:9");
+        bad(
+            "parent diagnostic restored after region", branches(),
+            [](Module &m) {
+                auto &op = m.functions[0].body.operations[1];
+                op.location = "parent.dsl.cpp:9:5";
+                // The nested definition is valid inside its branch, but cannot also
+                // define the enclosing operation result. Checked after the recursion.
+                op.results[0] = {3};
+            },
+            "add op #3 at parent.dsl.cpp:9:5");
+        bad(
+            "empty region retains its own diagnostic", branches(),
+            [](Module &m) {
+                auto &r = m.functions[0].body.operations[1].regions[1];
+                r.operations.clear();
+                r.terminator.reset();
+                r.location = "branch.dsl.cpp:11:7";
+            },
+            "add at branch.dsl.cpp:11:7");
+        bad(
+            "terminator has independent location", arithmetic(),
+            [](Module &m) {
+                auto &r = m.functions[0].body;
+                r.terminatorLocation = "return.dsl.cpp:14:5";
+                r.terminator = ReturnSuccess{{{99}}};
+            },
+            "add at return.dsl.cpp:14:5");
         ++cases;
         if (verify(arithmetic(), {}))
             throw std::runtime_error("missing registry accepted");

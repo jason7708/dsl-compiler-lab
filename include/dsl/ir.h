@@ -103,6 +103,9 @@ struct Operation;
 struct Region {
     std::vector<Operation> operations;
     std::optional<Terminator> terminator;
+    // Diagnostic metadata, independent of executable semantics and target layout.
+    std::string location = {};
+    std::string terminatorLocation = {};
 };
 struct Operation {
     OperationId id;

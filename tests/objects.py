@@ -154,6 +154,49 @@ int main() {
 }
 ''')
 
+    def test_empty_expression_branches_remap_existing_values(self):
+        source = '''double f(bool c, double v) { return c ? v : 0.0; }
+double g(double x, double y) {
+    bool t = y < 1.0;
+    if (x > 1.0 || t) return 1.0;
+    return 0.0;
+}
+bool and_refs(bool a, bool b) { return a && b; }
+bool or_refs(bool a, bool b) { return a || b; }
+bool bool_choice(bool c, bool a, bool b) { return c ? a : b; }
+double local_choice(bool c, double x, double y) {
+    double saved = x;
+    return c ? saved : y;
+}
+double nested_choice(bool c, bool d, double a, double b) {
+    return c ? (d ? a : b) : b;
+}
+double remapped_call(double unused, bool c, double y) { return f(c, y); }
+double empty_statement() { if (1.0 > 0.0) {} return 3.0; }
+'''
+        self.ok(self.compile(source))
+        (self.root / 'reference.h').write_text('namespace reference {\n' + source + '\n}')
+        self.execute('''#include "generated.h"
+#include "reference.h"
+int main() {
+    for (bool a : {false, true}) for (bool b : {false, true}) {
+        if (and_refs{}({}, {}, {a, b})->result != reference::and_refs(a, b)) return 1;
+        if (or_refs{}({}, {}, {a, b})->result != reference::or_refs(a, b)) return 2;
+        for (bool c : {false, true}) {
+            if (bool_choice{}({}, {}, {c, a, b})->result != reference::bool_choice(c, a, b)) return 3;
+        }
+        if (nested_choice{}({}, {}, {a, b, 17.0, 23.0})->result !=
+            reference::nested_choice(a, b, 17.0, 23.0)) return 4;
+        if (local_choice{}({}, {}, {a, 17.0, 23.0})->result != reference::local_choice(a, 17.0, 23.0)) return 5;
+        if (f{}({}, {}, {a, 17.0})->result != reference::f(a, 17.0)) return 6;
+        if (remapped_call{}({}, {}, {99.0, a, 17.0})->result != reference::remapped_call(99.0, a, 17.0)) return 7;
+    }
+    for (double x : {0.0, 2.0}) for (double y : {0.0, 2.0})
+        if (g{}({}, {}, {x, y})->result != reference::g(x, y)) return 8;
+    return empty_statement{}({}, {}, {})->result == 3.0 ? 0 : 9;
+}
+''', '-Wno-unused-parameter')
+
     def test_unit_success_failure_and_instance_state(self):
         self.execute('''#include <dsl_runtime/operation.h>
 struct Context { double factor; };
@@ -668,13 +711,111 @@ int main() {
 }
 ''')
 
+    def test_multi_event_shared_state_and_contracts(self):
+        source = '''#include "api.h"
+struct Quote { int id; double ask; };
+struct Trade { double price; bool valid; };
+struct TradeError { int code; };
+struct Tracker {
+    double mid = 0.0;
+    double total = 0.0;
+    double operator()(Quote event) {
+        double bid = get_bid(event.id);
+        mid = (bid + event.ask) / 2.0;
+        return mid;
+    }
+    bool operator()(Trade event) {
+        total = total + event.price;
+        if (!event.valid) throw TradeError{7};
+        return event.price > mid;
+    }
+};
+struct Pipeline {
+    Tracker tracker;
+    double operator()(Quote event) { return tracker(event); }
+    bool operator()(Trade event) { return tracker(event); }
+};
+double local_calls(Quote q) {
+    Tracker tracker;
+    double mid = tracker(q);
+    bool above = tracker(Trade{q.ask, true});
+    return above ? mid : 0.0;
+}
+'''
+        self.ok(self.compile(source, '--context-function', 'get_bid'))
+        (self.root / 'reference.h').write_text('namespace reference {\n' + source + '\n}')
+        self.execute('''#include "generated.h"
+#include "reference.h"
+#include <type_traits>
+int reads = 0;
+double get_bid(int id) { ++reads; return 10.0 + id; }
+int main() {
+    using Q = Tracker::contract_for<Quote>;
+    using T = Tracker::contract_for<Trade>;
+    static_assert(std::is_same_v<Q::state, T::state>);
+    static_assert(std::is_same_v<Q::result, double>);
+    static_assert(std::is_same_v<T::result, bool>);
+    static_assert(std::is_same_v<T::error, TradeError>);
+    static_assert(std::is_standard_layout_v<Tracker_state>);
+    static_assert(std::is_trivially_copyable_v<Tracker_state>);
+    static_assert(sizeof(Tracker_state) == 2 * sizeof(double));
+    dsl_runtime::unit<Tracker> unit, separate;
+    const Quote quote{2, 16.0};
+    auto ctx = prepare_Tracker_context(quote);
+    if (reads != 1) return 1;
+    auto q = unit.on_event(ctx, quote);
+    reference::Tracker native;
+    if (!q || q->result != native(reference::Quote{2, 16.0})) return 2;
+    if (unit.state().mid != 14.0 || separate.state().mid != 0.0) return 3;
+    auto t = unit.on_event({}, Trade{15.0, true});
+    if (!t || t->result != native(reference::Trade{15.0, true}) || unit.state().total != native.total) return 4;
+    auto failed = unit.on_event({}, Trade{100.0, false});
+    if (failed || failed.error().code != 7 || unit.state().total != 15.0 || unit.state().mid != 14.0) return 5;
+    t = unit.on_event({}, Trade{13.0, true});
+    if (!t || t->result || unit.state().total != 28.0) return 6;
+    Tracker_state state{14.0, 4.0};
+    const Tracker op;
+    auto direct = op({}, state, Trade{15.0, true});
+    if (!direct || direct->new_state.total != 19.0 || state.total != 4.0) return 7;
+    dsl_runtime::unit<Pipeline> pipeline;
+    auto pq = pipeline.on_event(prepare_Pipeline_context(quote), quote);
+    auto pt = pipeline.on_event({}, Trade{15.0, true});
+    auto pf = pipeline.on_event({}, Trade{100.0, false});
+    if (!pq || pq->result != 14.0 || !pt || !pt->result || pf || pipeline.state().tracker_total != 15.0) return 8;
+    auto lc = prepare_local_calls_context(quote);
+    auto local = local_calls{}(lc, {}, quote);
+    if (!local || local->result != 14.0) return 9;
+    dsl_runtime::unit<Tracker> initialized(Tracker_state{20.0, 3.0});
+    auto initial = initialized.on_event({}, Trade{15.0, true});
+    return initial && !initial->result && initialized.state().total == 18.0 ? 0 : 10;
+}
+''')
+
+    def test_multi_event_scalar_dispatch(self):
+        self.ok(self.compile('''struct Accumulate {
+    double total = 1.0;
+    double operator()(double value) { total = total + value; return total; }
+    bool operator()(bool reset) { if (reset) total = 0.0; return reset; }
+};
+'''))
+        self.execute('''#include "generated.h"
+int main() {
+    dsl_runtime::unit<Accumulate> unit;
+    auto first = unit.on_event(prepare_Accumulate_context(2.0), 2.0);
+    auto reset = unit.on_event({}, true);
+    auto last = unit.on_event({}, 4.0);
+    return first && first->result == 3.0 && reset && reset->result && last && last->result == 4.0 ? 0 : 1;
+}
+''', '-fno-exceptions')
+
     def test_struct_rejections(self):
         cases = [
             ('legacy state', 'struct S { double x; }; double f(S& state) { return state.x; }', 'struct members'),
             ('missing default', 'struct A { double x; double operator()() { return x; } };', 'initializers'),
             ('computed default', 'struct A { double x = 1.0 + 2.0; double operator()() { return x; } };', 'literal initializers'),
-            ('multiple operators', 'struct A { double operator()() { return 1.0; } double operator()(double x) { return x; } };', 'exactly one'),
-            ('other method', 'struct A { double helper() { return 1.0; } double operator()() { return helper(); } };', 'exactly one'),
+            ('multiple operators', 'struct A { double operator()() { return 1.0; } double operator()(double x) { return x; } };', 'exactly one event'),
+            ('same event type', 'struct A { double operator()(double x) { return x; } double operator()(double x) const { return x; } };', 'distinct event types'),
+            ('other method', 'struct A { double helper() { return 1.0; } double operator()() { return helper(); } };', 'no other methods'),
             ('constructor', 'struct A { A() {} double operator()() { return 1.0; } };', 'constructors'),
             ('static data', 'struct A { static double x; double operator()() { return x; } };', 'unsupported'),
             ('mutable data', 'struct A { mutable double x = 0.0; double operator()() { return x; } };', 'unsupported'),

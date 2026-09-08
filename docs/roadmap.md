@@ -130,3 +130,32 @@ Object 模式現在把所有 DSL 函數都公開，缺少「公開 operation」�
 應先選定具體 target 與最小計算集合，定義 context／event／state 的輸入輸出、error 表示、指令選擇與外部操作映射，再用第 2 項的對照基準驗收。
 
 ISA backend、硬體 ABI、一般 IR 序列化與最佳化 pipeline 都尚未實作。本輪不將它們列為已完成。
+
+## 追蹤修正：空分支引用與 verifier 來源位置
+
+本輪另確認並修正兩個問題，未改變上方尚未完成的架構待辦。
+
+### 空分支也必須重映射結果
+
+Object frontend 的 cloneBranch 曾以「分支是否有 instructions」決定是否 remap result。但 `c ? v : 0.0` 的 true 分支只是引用既有 v，可以沒有指令，卻仍必須交付正確的值。舊程式會把結果留在預設 ID 0；型別不同時被 verifier 錯誤拒絕，型別相同時可能算錯。
+
+現在依分支是否需要產生值決定：Select 的兩側總是重映射 result，包含 `?:`、`&&`、`||`；If 的 statement 分支不讀取無意義的 result。
+
+新增測試將 bool 真值組合、參數／local 引用、巢狀 `?:`、helper 呼叫中改變的 ValueId 與空 statement 分支，對照同一份來源的普通 C++ 執行結果。使用者提供的 f／g 兩例也納入其中。
+
+### Verifier 使用真實 OP／terminator 位置
+
+原本 verifier 雖然會讀 op.location，semantic 卻把所有 OP 都設成函數起點；遞迴檢查也可能讓子 region 的位置留在診斷狀態。
+
+現在來源位置從 Clang 的 expression／statement 傳到私有來源表示，再經 clone／semantic 傳入核心。OP 保存運算子位置，region 與 terminator 分別保存區域／return／yield 位置；這些都是與 backend 無關的診斷 metadata。
+
+Verifier 進入與離開函數、OP、region 時保存／還原位置，OP 錯誤另外附 OperationId。沒有來源位置的手動 IR 不會捏造行列，仍提供可用的函數／OP 身分。
+
+新增的 `frontend_locations` 測試使用公開 compile API 建立真實 IR，再刻意破壞 operand 或 yield，檢查原始檔行／欄、helper 原始位置以及父計算位置的還原。Frontend 的四份實作抽成 dsl_frontend library，讓測試與 CLI 使用同一份程式，不新增測試用的 CLI 注入開關。Core／C++ backend 仍可獨立建置。
+
+
+## 已完成：多 event 的 struct 入口
+
+支援以不同 event 型別多載 `operator()`。每個多載須有一個 event 參數，具名 member function 和自動配對 event 留待後續討論。入口各自有 context／result／error，共用同一份 struct state，成功才提交；成員及 local 計算物件都可用普通 C++ 呼叫語法組合。
+
+核心 IR 維持普通函數，新增分組僅位於 UnitEnvelope.groups。C++ backend 驗證分組後生成多載 function object、按 event 選擇的 contract_set 和 context binder；unit 仍持有固定大小的 state。單入口 API 保持相容。範例與限制見 [multi-event.md](multi-event.md)。

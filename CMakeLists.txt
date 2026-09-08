@@ -58,14 +58,18 @@ if(DSL_BUILD_COMPILER)
 
     add_subdirectory(runtime)
     configure_file(cmake/build-info.txt.in build-info.txt @ONLY)
-    add_executable(dslc src/main.cpp src/frontend.cpp src/frontend_ops.cpp
-        src/frontend_bindings.cpp src/semantic.cpp src/config.cpp)
-    target_include_directories(dslc PRIVATE include)
-    target_include_directories(dslc SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${DSL_CLANG_INCLUDE_DIR})
-    target_compile_definitions(dslc PRIVATE DSL_LLVM_VERSION="${DSL_LLVM_VERSION}"
-        DSL_RUNTIME_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
-    target_compile_options(dslc PRIVATE -Wall -Wextra -Wpedantic)
-    target_link_libraries(dslc PRIVATE dsl_cpp_backend ${DSL_CLANG_CPP_LIBRARY} LLVM)
+    add_library(dsl_frontend STATIC src/frontend.cpp src/frontend_ops.cpp
+        src/frontend_bindings.cpp src/semantic.cpp)
+    target_link_libraries(dsl_frontend PUBLIC dsl_ir PRIVATE ${DSL_CLANG_CPP_LIBRARY} LLVM)
+    add_executable(dslc src/main.cpp src/config.cpp)
+    target_link_libraries(dslc PRIVATE dsl_frontend dsl_cpp_backend LLVM)
+    foreach(target dsl_frontend dslc)
+        target_include_directories(${target} PRIVATE include)
+        target_include_directories(${target} SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS} ${DSL_CLANG_INCLUDE_DIR})
+        target_compile_definitions(${target} PRIVATE DSL_LLVM_VERSION="${DSL_LLVM_VERSION}"
+            DSL_RUNTIME_INCLUDE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/runtime/include")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endforeach()
 endif()
 
 include(CTest)
@@ -77,6 +81,9 @@ if(BUILD_TESTING)
     target_link_libraries(backend_tests PRIVATE dsl_cpp_backend)
     add_test(NAME backend_boundary COMMAND backend_tests)
     if(DSL_BUILD_COMPILER)
+        add_executable(frontend_location_tests tests/frontend_locations.cpp)
+        target_link_libraries(frontend_location_tests PRIVATE dsl_frontend)
+        add_test(NAME frontend_locations COMMAND frontend_location_tests)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_test(NAME compiler_integration
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py

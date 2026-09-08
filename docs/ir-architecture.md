@@ -33,9 +33,9 @@ flowchart TD
 | `ir::Module computation` | 型別、精確常數、邏輯外部介面、函數、值、OP、region、terminator | C++ 名稱、include、context 取得、unit 提交 |
 | `CppLinkage cpp` | 真實 header、巨集隔離、外部 C++ symbol、record／field 的 C++ 名稱與預設值映射 | 決定 computation 的運算或控制流程 |
 | `HostBindings bindings` | 哪個核心參數由哪個 provider 準備，provider 的 event／常數引數 | 執行核心運算或讀取核心暫存值／state |
-| `UnitEnvelope units` | 對外 export、event 參數集合、state 參數與初值 | 定義核心 OP 或固定實體記憶體 layout |
+| `UnitEnvelope units` | 對外 export、event 參數集合、state 參數與初值、多入口 unit 的 FunctionId 分組 | 定義核心 OP 或固定實體記憶體 layout |
 
-`debugName` 與 operation 的 `location` 用於診斷。函數、外部介面及型別的身分由 ID 決定，不靠除錯名稱解析。C++ backend 接受整個 `Program`，共用 verifier 只接受 `ir::Module` 與 registry。
+`debugName`、operation／region 的 `location` 與 region 的 `terminatorLocation` 用於診斷。Frontend 保留每個來源運算子／敘述的位置，object 呼叫展開時也保留 helper 的原始位置；verifier 以作用域方式保存與還原目前診斷位置，避免子 region 的位置污染父 OP 或下一個分支。函數、外部介面及型別的身分由 ID 決定，不靠除錯名稱解析。C++ backend 接受整個 `Program`，共用 verifier 只接受 `ir::Module` 與 registry。
 
 ## 1. 型別、常數與 ID
 

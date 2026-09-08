@@ -1,4 +1,5 @@
 #include "dsl/verify.h"
+#include "scoped_context.h"
 #include <algorithm>
 #include <format>
 #include <set>
@@ -125,6 +126,8 @@ class Verifier {
     // Return true when this region can reach its enclosing continuation (Yield).
     bool region(const Region &r, std::vector<bool> available, const Signature &boundary,
                 const std::optional<std::vector<TypeId>> &yields, unsigned depth) {
+        detail::ScopedContext regionContext(
+            where, r.location.empty() ? where : f->debugName + " at " + r.location);
         require(depth < 256, "region nesting limit exceeded");
         bool reachable = true;
         auto use = [&](ValueId id) {
@@ -132,7 +135,9 @@ class Verifier {
             require(available[id.value], "value does not dominate use or escapes its region");
         };
         for (const auto &op : r.operations) {
-            where = f->debugName + (op.location.empty() ? "" : " at " + op.location);
+            detail::ScopedContext operationContext(
+                where, std::format("{} op #{}{}", f->debugName, op.id.value,
+                                   op.location.empty() ? "" : " at " + op.location));
             require(reachable, "operation after unconditional termination");
             require(operations.insert(op.id.value).second, "duplicate OperationId");
             const auto *definition = lookup(op.code, definitions);
@@ -269,6 +274,9 @@ class Verifier {
                 available[id.value] = defined[id.value] = true;
             }
         }
+        detail::ScopedContext terminatorContext(
+            where,
+            r.terminatorLocation.empty() ? where : f->debugName + " at " + r.terminatorLocation);
         require(r.terminator.has_value(), "missing terminator");
         if (const auto *term = std::get_if<Yield>(&*r.terminator)) {
             require(reachable && yields.has_value(), "yield outside a yielding region");
@@ -299,13 +307,17 @@ class Verifier {
         for (const auto &d : definitions)
             require(registered.insert(d.code).second, "duplicate OP registration");
         typesAndConstants();
-        for (const auto &e : m.externals)
+        for (const auto &e : m.externals) {
+            detail::ScopedContext context(where, e.debugName);
             signature(e.signature);
-        for (const auto &fn : m.functions)
+        }
+        for (const auto &fn : m.functions) {
+            detail::ScopedContext context(where, fn.debugName);
             signature(fn.signature);
+        }
         for (const auto &fn : m.functions) {
             f = &fn;
-            where = fn.debugName;
+            detail::ScopedContext context(where, fn.debugName);
             for (auto t : fn.values)
                 type(t);
             defined.assign(fn.values.size(), false);

@@ -101,8 +101,10 @@ struct RecordDeclaration {
 // Value IDs are local to a function; each region owns its executed instructions.
 // A select evaluates only its chosen region, then yields that region's result.
 struct Region {
-    std::vector<ValueId> instructions;
+    std::vector<ValueId> instructions = {};
     ValueId result = 0;
+    std::string location = {};
+    std::string resultLocation = {};
 };
 struct Select {
     ValueId condition;
@@ -156,6 +158,7 @@ struct Value {
     Type type = Type::Double;
     Operation operation;
     std::string recordName = {};
+    std::string location = {};
 };
 struct Function {
     std::string name = "compute";
@@ -165,6 +168,7 @@ struct Function {
     std::string location = {};
     std::string returnRecord = {};
     std::string stateRecord = {};
+    std::string unitName = {}; // Nonempty for a multi-entry computation.
     std::string errorRecord = {};
     std::optional<ValueId> stateParameter = {};
 };

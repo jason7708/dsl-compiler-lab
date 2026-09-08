@@ -116,7 +116,7 @@ if (!event.enabled || ask < bid) throw Error{1};
 
 | 項目 | 規則 |
 | --- | --- |
-| 計算 struct | 全域 public aggregate struct，恰好一個在 struct 內定義的 `operator()`，可加 const。 |
+| 計算 struct | 全域 public aggregate struct，在 struct 內定義 `operator()`，可加 const；多載入口須各有一個不同型別的 event，詳見 [多 event](multi-event.md)。 |
 | Scalar 成員 | double、bool、32-bit int，每個都必須有明確 literal 初值，可用正負數及 `{}` 零初始化。初值不接受函數呼叫或計算式。 |
 | 子計算成員 | 另一個計算 struct，可用預設初始化或 literal aggregate 初始化覆蓋初值。 |
 | Local 實例 | 普通 default／aggregate 初始化，每次執行重新建立；不支援複製實例或整個實例賦值。 |

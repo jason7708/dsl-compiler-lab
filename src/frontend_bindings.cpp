@@ -1,6 +1,7 @@
 #include "dsl/visit.h"
 #include "frontend_ir.h"
 #include "frontend_math.h"
+#include "scoped_context.h"
 
 #include <algorithm>
 #include <format>
@@ -85,6 +86,8 @@ class ObjectLowering {
 
   private:
     ValueId add(Value value, Region &region) {
+        if (value.location.empty())
+            value.location = currentLocation_;
         if (output_.values.size() >= 100000)
             throw InvalidObject(output_.location +
                                 ": error: object expansion exceeds the 100000-value limit");
@@ -134,6 +137,8 @@ class ObjectLowering {
     void cloneRegion(const Function &source, const Region &input, Region &region,
                      std::vector<ValueId> &mapping, bool conditional, const std::string &prefix,
                      unsigned depth) {
+        region.location = input.location;
+        region.resultLocation = input.resultLocation;
         if (depth > 256)
             throw InvalidObject(source.location +
                                 ": error: object call expansion exceeds 256 levels");
@@ -146,6 +151,7 @@ class ObjectLowering {
         }
         for (const auto id : input.instructions) {
             const auto &value = source.values[id];
+            detail::ScopedContext location(currentLocation_, value.location);
             if (std::holds_alternative<Parameter>(value.operation))
                 continue;
             if (const auto *call = std::get_if<Call>(&value.operation)) {
@@ -216,12 +222,14 @@ class ObjectLowering {
                         region);
                 continue;
             }
-            auto cloneBranch = [&](const Region &input, bool guarded) {
+            auto cloneBranch = [&](const Region &input, bool producesValue) {
                 Region branch;
                 auto branchMapping = mapping;
-                cloneRegion(source, input, branch, branchMapping, guarded, prefix, depth);
-                if (!input.instructions.empty())
-                    branch.result = branchMapping[input.result];
+                cloneRegion(source, input, branch, branchMapping, true, prefix, depth);
+                // A select can yield an existing value without executing an instruction.
+                // Statement branches have no result to remap, even when nonempty.
+                if (producesValue)
+                    branch.result = branchMapping.at(input.result);
                 return branch;
             };
             auto operation = std::visit(
@@ -266,8 +274,8 @@ class ObjectLowering {
                         return Scope{std::move(body)};
                     },
                     [&](const If &op) -> Operation {
-                        return If{mapping[op.condition], cloneBranch(op.whenTrue, true),
-                                  cloneBranch(op.whenFalse, true)};
+                        return If{mapping[op.condition], cloneBranch(op.whenTrue, false),
+                                  cloneBranch(op.whenFalse, false)};
                     },
                     [&](const Select &op) -> Operation {
                         return Select{mapping[op.condition], cloneBranch(op.whenTrue, true),
@@ -291,6 +299,7 @@ class ObjectLowering {
     Function output_;
     std::unordered_set<ValueId> unstable_;
     std::size_t callSite_ = 0;
+    std::string currentLocation_;
 };
 
 } // namespace

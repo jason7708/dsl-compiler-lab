@@ -34,10 +34,16 @@ struct Export {
     std::optional<std::size_t> stateParameter;
     std::optional<ir::ConstantId> initialState;
 };
+// Entrypoints are ordinary core functions sharing one unit-owned state.
+struct UnitGroup {
+    std::string name;
+    std::vector<ir::FunctionId> entries;
+};
 struct UnitEnvelope {
     enum class Style { Scalar, Objects };
     Style style;
     std::vector<Export> exports;
+    std::vector<UnitGroup> groups = {};
 };
 struct Program {
     ir::Module computation;

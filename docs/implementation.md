@@ -33,7 +33,7 @@ Clang 負責完整 C++ 的解析與型別分析，DSL 另以允許清單限制�
 
 例如 scalar 模式的 `a + 1` 因 int → double 隱式轉型被拒絕；object 模式限定允許運算中的 int literal 提升，仍不允許一般 int 變數隱式轉 double。Clang 的普通讀值 cast、限定形式的 C++23 return NoOp 可以移除；其餘轉型須由明確規則接受。
 
-每個 DSL 函數本體都會檢查，包含未被呼叫的 helper。Scalar 與 object 的語法範圍不同，詳見 [數學語法](math.md)、[function objects](function-objects.md) 及 [state／error](state-and-errors.md)。
+每個 DSL 函數本體都會檢查，包含未被呼叫的 helper。Scalar 與 object 的語法範圍不同，詳見 [數學語法](math.md)、[function objects](function-objects.md) 及 [state／error](state-and-errors.md)。多載 `operator()` 的入口分組、contract 和共用 state 見 [多 event](multi-event.md)。
 
 ## 一個計算如何轉換
 
@@ -97,7 +97,8 @@ Registry 對浮點環境與外部呼叫採保守 effect 分類。未來 optimize
 | --- | --- | --- |
 | `dsl_ir` | [ir.h](../include/dsl/ir.h)、[registry.cpp](../src/registry.cpp)、[verify.cpp](../src/verify.cpp)、[ir.cpp](../src/ir.cpp) | C++23 標準函式庫 |
 | `dsl_cpp_backend` | [program.h](../include/dsl/program.h)、[codegen.cpp](../src/codegen.cpp) | dsl_ir，沒有 LLVM／Clang |
-| `dslc` | frontend、frontend_bindings、semantic、config、main | Clang／LLVM 20.1.8、dsl_cpp_backend |
+| `dsl_frontend` | frontend、frontend_bindings、semantic | Clang／LLVM 20.1.8、dsl_ir；供 CLI 與來源位置 API 測試共用 |
+| `dslc` | config、main | dsl_frontend、dsl_cpp_backend、LLVM |
 | `dsl_runtime` | [math.h](../runtime/include/dsl_runtime/math.h)、[math.cpp](../runtime/src/math.cpp)、[operation.h](../runtime/include/dsl_runtime/operation.h) | 標準 C++23；供生成程式使用 |
 
 `DSL_BUILD_COMPILER=OFF` 可只建 core／backend 與直接 API 測試。Frontend 私有 [frontend_ir.h](../src/frontend_ir.h) 仍保存來源導向的過渡結構，但不在公開 IR API，也不由 backend 使用。這項區分與原因見 [架構文件](ir-architecture.md)。
@@ -106,6 +107,6 @@ Registry 對浮點環境與外部呼叫採保守 effect 分類。未來 optimize
 
 使用 `std::expected` 傳遞錯誤，variant 表達互斥型別／terminator，strong ID 避免混用引用，span／string_view 提供非擁有 view，format／print 產生診斷，RAII 管理暫存輸出。Clang AST 的非擁有指標與 dyn_cast 保留其既有 ownership 模型。
 
-測試分為直接建構 IR 的 verifier tests、直接呼叫 C++ backend 的 metadata／capability tests，以及真實 CLI → 生成 → 編譯 → 執行的兩組 Python suites。除了預期結果，也比對原始 C++ 的 double bits、state 生命週期、錯誤提交邊界、provider 次數、拒絕診斷及既有輸出保護。實測數字與命令見 [validation.md](validation.md)。
+測試分為直接建構 IR 的 verifier tests、直接呼叫 C++ backend 的 metadata／capability tests、透過公開 compile API 核對來源位置再刻意破壞 IR 的診斷測試，以及真實 CLI → 生成 → 編譯 → 執行的兩組 Python suites。除了預期結果，也比對原始 C++ 的 double bits、state 生命週期、錯誤提交邊界、provider 次數、拒絕診斷及既有輸出保護。實測數字與命令見 [validation.md](validation.md)。
 
 目前尚未實作 ISA、serializer 或 optimizer；這次提供的是它們可共用且能獨立驗證的 IR 邊界。

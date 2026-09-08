@@ -860,6 +860,8 @@ LLVM 的機器生成流程包含指令選擇、排程與暫存器配置等工作
 | `--emit-objects` | 不需要 compute；各 DSL 函數與計算 struct 都生成可獨立使用的 function object。 |
 | 共用 IR | 沒有固定 compute 名稱；UnitEnvelope.exports 指定哪些計算對外公開。 |
 
+一個 struct 現在也能用不同 event 型別多載 `operator()`。每個入口對應一個 IR function，`UnitEnvelope.groups` 記錄哪些入口共用同一個 unit 的 state；host 以 event 型別選擇 context／result／error contract。用法見 [多 event 入口](multi-event.md)。
+
 沒有指定 compute 的 object 範例，可從 [stateful/accumulate.dsl.cpp](../examples/stateful/accumulate.dsl.cpp) 開始讀。
 
 **Intent** 曾用來討論輸出應該送往哪個 operation，目前已從介面移除。函數呼叫與條件表示計算依賴，host 決定如何對外交付結果。呼叫圖本身不會建立事件佇列，也沒有自動的動態路由或排程服務。
@@ -961,7 +963,8 @@ CLI 會先把完整生成內容寫好，成功才替換目標檔，避免語法�
 | --- | --- |
 | `dsl_ir` | 共用 IR、登記表、驗證器及文字顯示 |
 | `dsl_cpp_backend` | 核心與 metadata → C++ |
-| `dslc` | Clang frontend、來源轉換、CLI 與設定 |
+| `dsl_frontend` | Clang frontend 與來源轉換，供 CLI 及來源位置測試共用 |
+| `dslc` | CLI 與設定，串接 frontend 與 C++ backend |
 | `dsl_runtime` | 最終程式會使用的數學實作；contract／unit 另由 header 提供 |
 
 可以用 `-DDSL_BUILD_COMPILER=OFF` 只建 core／backend 與直接 API 測試，不查找 LLVM／Clang。**API，Application Programming Interface，程式介面**，在這裡指另一份程式能直接呼叫的函數與資料結構，例如 `ir::verify`。
@@ -982,7 +985,7 @@ CLI 會先把完整生成內容寫好，成功才替換目標檔，避免語法�
 
 浮點測試除了看列印的數字，也比較 double 的位元，因為正零／負零或最後幾個 bits 的差異可能無法從一般輸出看出來。State 測試則檢查成功提交、失敗保留、不同 instance 隔離和 helper 組合。
 
-最近一次完整程式驗證包含 49 個 verifier 案例、16 個 backend 邊界案例、40 個 Python 測試方法；執行環境及紀錄見 [validation.md](validation.md)。本文另實際核對了平均值的 AST／LLVM IR，並驗證本文 Accumulator 的三次事件例子。
+最近一次完整程式驗證包含 54 個 verifier 案例、23 個 backend 邊界案例、11 個 frontend 來源位置案例、43 個 Python 測試方法；執行環境及紀錄見 [validation.md](validation.md)。本文另實際核對了平均值的 AST／LLVM IR，並驗證本文 Accumulator 的三次事件例子。
 
 ## 20. 目前架構的邊界與下一步
 

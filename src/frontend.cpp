@@ -1,5 +1,6 @@
 #include "frontend_ir.h"
 #include "frontend_math.h"
+#include "scoped_context.h"
 
 #include <clang/AST/ASTConsumer.h>
 #include <clang/AST/ASTContext.h>
@@ -282,7 +283,7 @@ class Lowering final : public clang::ASTConsumer {
                 for (const auto *method : record->methods())
                     if (!method->isImplicit() && method->isOverloadedOperator() &&
                         method->getOverloadedOperator() == clang::OO_Call)
-                        computations_[record] = method;
+                        computations_[record].push_back(method);
             }
         }
         for (const auto *decl : context.getTranslationUnitDecl()->decls()) {
@@ -319,11 +320,18 @@ class Lowering final : public clang::ASTConsumer {
                     if (computations_.contains(record)) {
                         if (!collectComputation(record))
                             return;
-                        const auto *method = computations_.at(record);
-                        dslDeclarations_.emplace(method->getCanonicalDecl(), definitions.size());
-                        definitions.push_back(method);
-                        module_.functions.push_back(
-                            Function{.name = record->getNameAsString(), .values = {}, .body = {}});
+                        const auto &methods = computations_.at(record);
+                        for (std::size_t entry = 0; entry < methods.size(); ++entry) {
+                            const auto *method = methods[entry];
+                            dslDeclarations_.emplace(method->getCanonicalDecl(),
+                                                     definitions.size());
+                            definitions.push_back(method);
+                            auto name = record->getNameAsString();
+                            if (methods.size() > 1)
+                                name += "_entry_" + std::to_string(entry);
+                            module_.functions.push_back(
+                                Function{.name = name, .values = {}, .body = {}});
+                        }
                     } else if (!record->isThisDeclarationADefinition() &&
                                computations_.contains(record->getDefinition())) {
                         // The complete computation declaration is collected separately.
@@ -405,6 +413,8 @@ class Lowering final : public clang::ASTConsumer {
             bindings_.clear();
             const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(definition);
             currentComputation_ = method ? method->getParent() : nullptr;
+            if (currentComputation_ && computations_.at(currentComputation_).size() > 1)
+                ir_.unitName = currentComputation_->getNameAsString();
             if (!lowerFunction(definition))
                 return;
             module_.functions[id] = std::move(ir_);
@@ -615,22 +625,36 @@ class Lowering final : public clang::ASTConsumer {
                                          "inheritance or constructors");
             return false;
         }
-        const clang::CXXMethodDecl *operation = nullptr;
+        std::vector<clang::QualType> eventTypes;
         for (const auto *member : record->decls()) {
             if (member->isImplicit())
                 continue;
             if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(member)) {
-                if (operation || !method->isOverloadedOperator() ||
+                if (!method->isOverloadedOperator() ||
                     method->getOverloadedOperator() != clang::OO_Call || method->isStatic() ||
                     method->isVirtual() || method->isVolatile() ||
                     method->getRefQualifier() != clang::RQ_None ||
                     method->getAccess() != clang::AS_public ||
                     !method->doesThisDeclarationHaveABody() || !validSignature(method)) {
-                    error(member->getLocation(), "a computation requires exactly one public "
-                                                 "operator() definition and no other methods");
+                    error(member->getLocation(), "a computation requires public operator() "
+                                                 "definitions and no other methods");
                     return false;
                 }
-                operation = method;
+                if (computations_.at(record).size() > 1) {
+                    if (method->getNumParams() != 1) {
+                        error(method->getLocation(),
+                              "overloaded entries require exactly one event parameter");
+                        return false;
+                    }
+                    const auto event =
+                        method->getParamDecl(0)->getType().getCanonicalType().getUnqualifiedType();
+                    if (std::ranges::find(eventTypes, event) != eventTypes.end()) {
+                        error(method->getLocation(),
+                              "overloaded entries require distinct event types");
+                        return false;
+                    }
+                    eventTypes.push_back(event);
+                }
             } else if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(member);
                        field && field->getAccess() == clang::AS_public && !field->isBitField() &&
                        !field->isMutable() && !field->hasAttrs() && field->getIdentifier() &&
@@ -674,6 +698,7 @@ class Lowering final : public clang::ASTConsumer {
         return std::nullopt;
     }
     std::optional<ValueId> objectCall(const clang::CXXOperatorCallExpr *call) {
+        detail::ScopedContext location(currentLocation_, call->getExprLoc());
         const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(call->getDirectCallee());
         if (!method || call->getOperator() != clang::OO_Call ||
             !dslDeclarations_.contains(method->getCanonicalDecl())) {
@@ -808,7 +833,11 @@ class Lowering final : public clang::ASTConsumer {
         return true;
     }
     bool lowerFunction(const clang::FunctionDecl *function) {
+        detail::ScopedContext location(currentLocation_, function->getLocation());
+        ir_.body.location = sourcePosition(function->getBody() ? function->getBody()->getBeginLoc()
+                                                               : function->getLocation());
         for (const auto *parameter : function->parameters()) {
+            detail::ScopedContext location(currentLocation_, parameter->getLocation());
             const auto original = parameter->getOriginalType();
             const auto type = *inputType(original.getNonReferenceType());
             const auto record = recordName(original);
@@ -840,6 +869,7 @@ class Lowering final : public clang::ASTConsumer {
             return false;
         }
         for (const auto *statement : body->body()) {
+            detail::ScopedContext location(currentLocation_, statement->getBeginLoc());
             if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(statement)) {
                 if (statement != body->body_back()) {
                     error(ret->getReturnLoc(), "return is allowed only as the final statement");
@@ -849,8 +879,10 @@ class Lowering final : public clang::ASTConsumer {
                 if (!value)
                     return false;
                 ir_.body.result = *value;
+                ir_.body.resultLocation = sourcePosition(ret->getReturnLoc());
             } else if (const auto *declarations = llvm::dyn_cast<clang::DeclStmt>(statement)) {
                 for (const auto *decl : declarations->decls()) {
+                    detail::ScopedContext location(currentLocation_, decl->getLocation());
                     const auto *local = llvm::dyn_cast<clang::VarDecl>(decl);
                     if (!local || !inputType(local->getType().getUnqualifiedType()) ||
                         inputType(local->getType().getUnqualifiedType()) == Type::Record ||
@@ -906,8 +938,10 @@ class Lowering final : public clang::ASTConsumer {
     [[nodiscard]] ValueId add(Operation operation, Type type = Type::Double,
                               std::string record = {}) {
         const ValueId id = ir_.values.size();
-        ir_.values.push_back(Value{
-            .type = type, .operation = std::move(operation), .recordName = std::move(record)});
+        ir_.values.push_back(Value{.type = type,
+                                   .operation = std::move(operation),
+                                   .recordName = std::move(record),
+                                   .location = sourcePosition(currentLocation_)});
         currentRegion_->instructions.push_back(id);
         return id;
     }
@@ -928,9 +962,10 @@ class Lowering final : public clang::ASTConsumer {
         return exits;
     }
     std::optional<bool> statementBody(const clang::Stmt *statement) {
+        detail::ScopedContext location(currentLocation_, statement->getBeginLoc());
         if (const auto *block = llvm::dyn_cast<clang::CompoundStmt>(statement)) {
             auto outer = bindings_;
-            Region nested;
+            Region nested{.location = sourcePosition(block->getBeginLoc())};
             auto *parent = std::exchange(currentRegion_, &nested);
             const auto result = statements(block->body());
             currentRegion_ = parent;
@@ -954,7 +989,10 @@ class Lowering final : public clang::ASTConsumer {
                 return std::nullopt;
             }
             const auto outer = bindings_;
-            Region yes, no;
+            Region yes{.location = sourcePosition(conditional->getThen()->getBeginLoc())};
+            Region no{.location = sourcePosition(conditional->getElse()
+                                                     ? conditional->getElse()->getBeginLoc()
+                                                     : conditional->getIfLoc())};
             auto *parent = std::exchange(currentRegion_, &yes);
             auto yesFlow = statementBody(conditional->getThen());
             bindings_ = outer;
@@ -997,6 +1035,7 @@ class Lowering final : public clang::ASTConsumer {
         }
         if (const auto *declarations = llvm::dyn_cast<clang::DeclStmt>(statement)) {
             for (const auto *decl : declarations->decls()) {
+                detail::ScopedContext location(currentLocation_, decl->getLocation());
                 const auto *local = llvm::dyn_cast<clang::VarDecl>(decl);
                 if (local && computation(local->getType())) {
                     if (local->getStorageClass() != clang::SC_None || local->hasAttrs() ||
@@ -1095,7 +1134,8 @@ class Lowering final : public clang::ASTConsumer {
         return std::nullopt;
     }
     [[nodiscard]] std::optional<Region> branch(const clang::Expr *expr) {
-        Region region;
+        Region region{.location = sourcePosition(expr->getExprLoc()),
+                      .resultLocation = sourcePosition(expr->getExprLoc())};
         auto *outer = std::exchange(currentRegion_, &region);
         const auto result = expression(expr);
         currentRegion_ = outer;
@@ -1107,6 +1147,8 @@ class Lowering final : public clang::ASTConsumer {
     [[nodiscard]] std::optional<ValueId> expression(const clang::Expr *expr) {
         if (!expr)
             return std::nullopt; // Invalid C++ has already been diagnosed.
+        detail::ScopedContext location(
+            currentLocation_, expr->getExprLoc().isValid() ? expr->getExprLoc() : currentLocation_);
         if (expr->getExprLoc().isMacroID()) {
             error(expr->getExprLoc(), "macro expansions are not supported");
             return std::nullopt;
@@ -1358,7 +1400,8 @@ class Lowering final : public clang::ASTConsumer {
                     error(binary->getOperatorLoc(), "logical operators require bool operands");
                     return std::nullopt;
                 }
-                Region constant;
+                Region constant{.location = sourcePosition(binary->getOperatorLoc()),
+                                .resultLocation = sourcePosition(binary->getOperatorLoc())};
                 auto *outer = std::exchange(currentRegion_, &constant);
                 constant.result =
                     add(BooleanConstant{binary->getOpcode() == clang::BO_LOr}, Type::Bool);
@@ -1436,9 +1479,11 @@ class Lowering final : public clang::ASTConsumer {
     std::vector<const clang::FunctionDecl *> definitions_;
     std::unordered_map<const clang::FunctionDecl *, FunctionId> dslDeclarations_;
     Region *currentRegion_ = &ir_.body;
+    clang::SourceLocation currentLocation_;
     std::unordered_map<const clang::FunctionDecl *, MathFunction> builtinDeclarations_;
     std::unordered_map<const clang::ValueDecl *, ValueId> bindings_;
-    std::unordered_map<const clang::CXXRecordDecl *, const clang::CXXMethodDecl *> computations_;
+    std::unordered_map<const clang::CXXRecordDecl *, std::vector<const clang::CXXMethodDecl *>>
+        computations_;
     const clang::CXXRecordDecl *currentComputation_ = nullptr;
 };
 
@@ -1465,7 +1510,7 @@ class Action final : public clang::ASTFrontendAction {
 } // namespace
 
 std::optional<Module> parse(std::string_view source, std::string_view filename,
-                              const CompileOptions &options) {
+                            const CompileOptions &options) {
     std::optional<Module> result;
     HeaderPolicy headers{.options = options, .included = {}, .macros = {}};
     std::vector<std::string> arguments = {"-xc++",
@@ -1495,4 +1540,4 @@ std::optional<Module> parse(std::string_view source, std::string_view filename,
         return std::nullopt;
     return result;
 }
-} // namespace dsl
+} // namespace dsl::source

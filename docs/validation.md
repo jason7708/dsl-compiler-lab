@@ -1,6 +1,6 @@
 # 本次建置與驗證紀錄
 
-日期：2026-09-08。以下為完成共用 IR 分層、獨立 verifier、C++ backend 遷移，並保留 struct state／typed error 行為後，在此 workspace 實際重新建置與執行的結果。
+日期：2026-09-08。以下為完成共用 IR 分層、獨立 verifier、C++ backend 遷移，修正 object 空分支結果重映射與 verifier 來源位置，並加入多 event struct 入口後，在此 workspace 實際重新建置與執行的結果。
 
 ## 環境
 
@@ -63,22 +63,27 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-CMake configure 成功，`dsl_ir`、`dsl_cpp_backend`、`dslc` 與兩個 C++ 測試程式編譯並連結成功；runtime 的 `math.cpp` 另編譯成 `libdsl_runtime.a`。LLVM configure 顯示未找到 LibEdit、zstd、CURL 等選用依賴；此工具使用的 AST／Tooling 路徑不需要它們，沒有阻擋建置或測試。
+CMake configure 成功，`dsl_ir`、`dsl_cpp_backend`、`dsl_frontend`、`dslc` 與三個 C++ 測試程式編譯並連結成功；runtime 的 `math.cpp` 另編譯成 `libdsl_runtime.a`。LLVM configure 顯示未找到 LibEdit、zstd、CURL 等選用依賴；此工具使用的 AST／Tooling 路徑不需要它們，沒有阻擋建置或測試。
 
 ## 實際測試結果
 
-```text
-1/4 Test #1: ir_verifier ...................... Passed  0.00 sec
-2/4 Test #2: backend_boundary ................. Passed  0.00 sec
-3/4 Test #3: compiler_integration ............. Passed 49.16 sec
-4/4 Test #4: object_integration ............... Passed  6.49 sec
-100% tests passed, 0 tests failed out of 4
-Total Test time (real) = 55.65 sec
-```
+本次五個測試項目最終均通過，完整套件與後續針對受影響項目的重跑結果列於下表。測試過程修正了測試程式的 IR 欄位順序與既有限制不相容的案例；一輪整合測試曾與 dslc 重新連結重疊而失敗，已在建置完成後分別重跑 scalar／object 套件通過。
 
-這是 **4 個 CTest entries**：49 個直接構造 IR 的 verifier 案例、16 個 backend API 邊界案例，以及 **40 個 Python unittest 方法**（scalar／external 15 個、object 25 個）。
+| CTest 項目 | 結果 | 時間 |
+| --- | --- | --- |
+| ir_verifier | 通過 | 0.00 秒 |
+| backend_boundary | 通過 | 0.00 秒 |
+| frontend_locations | 通過 | 0.02 秒 |
+| compiler_integration | 通過 | 52.80 秒 |
+| object_integration | 通過 | 7.82 秒 |
+
+這是 **5 個 CTest entries**：54 個直接構造 IR 的 verifier 案例、23 個 backend API 邊界案例、11 個 frontend 來源位置案例，以及 **43 個 Python unittest 方法**（scalar／external 15 個、object 28 個）。Core-only 建置的兩個 CTest 項目也全部通過。
 
 Verifier 案例涵蓋型別／值／OP／constant ID、arity、定義唯一性、ancestor capture／sibling escape、call signature、error、missing／invalid terminator、欄位及 registry。Backend 案例直接建構 Program，驗證 source-independent codegen、metadata 拒絕、backend 自行驗證核心，以及「共用 IR 接受 binary32、目前 C++ backend 明確拒絕」的能力分工。
+
+本次空分支回歸測試包含使用者提供的 f／g、bool 真值組合、local 引用、巢狀條件、helper 展開後的 ValueId 變更與空 statement 分支，將生成結果對照相同來源的普通 C++。來源位置測試透過公開 compile API 取得 IR，再破壞 operand／yield，確認 verifier 指向實際的運算子、helper 原始位置或 return／yield，而非函數起點。另直接構造 IR，確認遞迴驗證後會還原父 OP 的診斷位置。
+
+多 event 測試涵蓋不同 record／scalar event 分派、每個入口的 context／result／error contract、交錯事件共用 state、不同 unit 隔離、初始化覆寫、typed error 回滾、直接呼叫不改動輸入，以及 member／local 多載呼叫組合。Backend 另驗證不經 frontend 的多入口 Program，拒絕缺少或重複的入口、重複 event 型別、名稱碰撞與不一致的 state。`examples/multi_event.dsl.cpp` 與 driver 已依 [multi-event.md](multi-event.md) 命令生成、以 C++23／`-fno-exceptions` 編譯並執行，退出碼為 0。
 
 其中資料驅動案例包含：
 
@@ -89,7 +94,7 @@ Verifier 案例涵蓋型別／值／OP／constant ID、arity、定義唯一性�
 - 同一子物件重複呼叫共用 state、不同子物件隔離、三層組合與初值，對照相同原始 struct 的普通 C++ 執行結果。
 - 區域計算物件每次事件重新建立；literal 初值、子物件 aggregate 初值覆蓋、this／巢狀 scalar 成員讀寫。
 - 不同子物件的失敗提交邊界、const operator、provider 抽取，以及生成碼不含 intent。
-- 17 組 struct 拒絕案例：舊 reference state、未初始化／非 literal 初值、constructor／其他 method、state 欄位撞名、計算物件 event、條件及 state 依賴 provider。
+- 18 組 struct 拒絕案例：舊 reference state、未初始化／非 literal 初值、constructor／其他 method、state 欄位撞名、計算物件 event、條件及 state 依賴 provider。
 - 14 組新增 feature 拒絕案例，涵蓋不同 error type、state 來源、提前退出後的 context 讀取及尚未支援的語法。
 - JSON 相對路徑、重複 imports、CLI 組合、imported config 覆寫保護，以及 9 組無效設定案例和缺少 CLI 參數。
 - Repo 的 stateful library 範例作為 object suite 的一個端到端測試。

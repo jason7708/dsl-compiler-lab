@@ -273,3 +273,5 @@ CTest 包含獨立 IR verifier 與 backend API 測試，也會執行真實 CLI�
 沒有加入 LLVM IR、MLIR、JIT、Python binding 或 FPGA 後端。Object 模式的函數展開用於建立完整 context 需求；尚未加入一般最佳化 pipeline。
 
 Clang API 背景可參考官方 [LibTooling 文件](https://clang.llvm.org/docs/LibTooling.html)；本專案實際編譯並驗證的是 20.1.8 標頭。
+
+多種 event 觸發同一份 struct state 的用法、contract 與可執行範例，見 [多 event 入口](docs/multi-event.md)。

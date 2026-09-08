@@ -129,17 +129,27 @@ class Emitter {
             t = fieldType(t, id);
         return t;
     }
-    bool recordEvent(const Export &e) const {
-        return e.eventParameters.size() == 1 &&
-               std::holds_alternative<c::RecordType>(
-                   m.types[m.functions[e.function.value]
-                               .signature.parameters[e.eventParameters[0]]
-                               .value]);
+    bool grouped(const Export &e) const {
+        return std::ranges::any_of(p.units.groups, [&](const UnitGroup &g) {
+            return std::ranges::find(g.entries, e.function) != g.entries.end();
+        });
+    }
+    const Export &entry(c::FunctionId id) const {
+        auto it = std::ranges::find(p.units.exports, id, &Export::function);
+        require(it != p.units.exports.end(), "unit entry is not exported");
+        return *it;
+    }
+    bool directEvent(const Export &e) const {
+        return grouped(e) || (e.eventParameters.size() == 1 &&
+                              std::holds_alternative<c::RecordType>(
+                                  m.types[m.functions[e.function.value]
+                                              .signature.parameters[e.eventParameters[0]]
+                                              .value]));
     }
     std::string eventArgument(const Export &e, std::size_t parameter) const {
         auto it = std::ranges::find(e.eventParameters, parameter);
         require(it != e.eventParameters.end(), "missing event parameter");
-        return recordEvent(e) ? "event" : "event." + e.eventFields[it - e.eventParameters.begin()];
+        return directEvent(e) ? "event" : "event." + e.eventFields[it - e.eventParameters.begin()];
     }
     std::string bindingArgument(const Export &e, const BindingArgument &a) const {
         const auto &fn = m.functions[e.function.value];
@@ -270,6 +280,32 @@ class Emitter {
                 require(!e.stateParameter && !fn.signature.error &&
                             p.bindings.functions[e.function.value].empty(),
                         "scalar export cannot have state, errors or context providers");
+        }
+        std::set<std::uint32_t> groupedEntries;
+        for (const auto &g : p.units.groups) {
+            require(p.units.style == UnitEnvelope::Style::Objects,
+                    "unit groups require object mode");
+            require(identifier(g.name) && names.insert(g.name).second, "unit group name conflict");
+            require(names.insert("prepare_" + g.name + "_context").second,
+                    "unit group binder name conflict");
+            require(g.entries.size() > 1, "unit group requires multiple entries");
+            std::optional<c::TypeId> state;
+            std::optional<c::ConstantId> initial;
+            std::set<std::string> events;
+            for (auto id : g.entries) {
+                const auto &e = entry(id);
+                require(groupedEntries.insert(id.value).second, "duplicate unit group entry");
+                require(e.stateParameter.has_value(), "unit group entry requires state");
+                require(e.eventParameters.size() == 1, "unit group entry requires one event");
+                const auto &fn = m.functions[id.value];
+                auto t = fn.signature.parameters[*e.stateParameter];
+                require(!state || (*state == t && initial == e.initialState),
+                        "unit group state mismatch");
+                state = t;
+                initial = e.initialState;
+                require(events.insert(type(fn.signature.parameters[e.eventParameters[0]])).second,
+                        "unit group requires distinct event types");
+            }
         }
     }
     std::string tuple(const std::vector<c::TypeId> &types) const {
@@ -483,7 +519,7 @@ class Emitter {
         for (const auto &b : bindings)
             text += "    " + type(fn.signature.parameters[b.parameter]) + " " + b.field + ";\n";
         text += "};\n";
-        if (recordEvent(e))
+        if (directEvent(e))
             text += "using " + name +
                     "_event = " + type(fn.signature.parameters[e.eventParameters[0]]) + ";\n";
         else {
@@ -556,6 +592,30 @@ class Emitter {
         return text;
     }
 
+    std::string exportGroup(const UnitGroup &g) const {
+        const auto &first = entry(g.entries.front());
+        std::string text = "struct " + g.name + " : ";
+        for (std::size_t i = 0; i < g.entries.size(); ++i) {
+            if (i)
+                text += ", ";
+            text += entry(g.entries[i]).name;
+        }
+        text += " {\n    using contract_t = dsl_runtime::contract_set<" + first.name + "_state";
+        for (auto id : g.entries)
+            text += ", " + entry(id).name + "_contract";
+        text +=
+            ">;\n    template <class Event> using contract_for = contract_t::for_event<Event>;\n";
+        for (auto id : g.entries)
+            text += "    using " + entry(id).name + "::operator();\n";
+        text += "};\n";
+        for (auto id : g.entries) {
+            const auto &e = entry(id);
+            text += "inline " + e.name + "_context prepare_" + g.name + "_context(const " + e.name +
+                    "_event& event) { return prepare_" + e.name + "_context(event); }\n";
+        }
+        return text;
+    }
+
   public:
     explicit Emitter(const Program &program) : p(program), m(program.computation) {}
     std::string run() {
@@ -615,6 +675,8 @@ class Emitter {
                 text += ")); }\n";
             }
         }
+        for (const auto &g : p.units.groups)
+            text += exportGroup(g);
         return text;
     }
 };

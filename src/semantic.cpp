@@ -2,6 +2,7 @@
 #include "dsl/verify.h"
 #include "frontend_ir.h"
 #include "frontend_math.h"
+#include "scoped_context.h"
 #include <algorithm>
 #include <bit>
 #include <format>
@@ -21,6 +22,7 @@ class Semantic {
     c::Function *output = nullptr;
     std::set<s::ValueId> mutableIds;
     std::uint32_t nextOperation = 0;
+    std::string_view currentLocation;
     using Env = std::vector<std::optional<c::ValueId>>;
     static std::uint32_t index(std::size_t n) {
         if (n > 1000000)
@@ -77,8 +79,8 @@ class Semantic {
     }
     c::Operation make(c::OpCode code, std::vector<c::ValueId> operands,
                       std::vector<c::TypeId> results, c::Attribute attr = {}) {
-        c::Operation op{{nextOperation++}, code, std::move(operands), {},
-                        std::move(attr),   {},   input->location};
+        c::Operation op{{nextOperation++}, code, std::move(operands),         {},
+                        std::move(attr),   {},   std::string(currentLocation)};
         for (auto t : results)
             op.results.push_back(newValue(t));
         return op;
@@ -152,12 +154,18 @@ class Semantic {
     }
     // Assignments disappear here: each environment entry denotes its current immutable value.
     bool region(const s::Region &from, c::Region &to, Env &env, std::optional<s::ValueId> state) {
+        to.location = from.location;
+        to.terminatorLocation = from.resultLocation;
         for (auto id : from.instructions) {
             const auto &v = input->values[id];
+            detail::ScopedContext location(
+                currentLocation,
+                std::string_view(v.location.empty() ? input->location : v.location));
             if (std::holds_alternative<s::Parameter>(v.operation) ||
                 std::holds_alternative<s::ContextRead>(v.operation))
                 continue;
             if (const auto *p = std::get_if<s::Return>(&v.operation)) {
+                to.terminatorLocation = currentLocation;
                 if (p->failure)
                     to.terminator = c::ReturnError{get(env, p->value)};
                 else {
@@ -266,6 +274,7 @@ class Semantic {
                 to.operations.push_back(std::move(op));
                 if (!continues) {
                     to.terminator = c::Unreachable{};
+                    to.terminatorLocation = currentLocation;
                     return false;
                 }
                 continue;
@@ -425,6 +434,15 @@ class Semantic {
             }
             if (source.objectMode || i == source.entry)
                 program.units.exports.push_back(std::move(exported));
+            if (!input->unitName.empty()) {
+                auto group =
+                    std::ranges::find(program.units.groups, input->unitName, &UnitGroup::name);
+                if (group == program.units.groups.end()) {
+                    program.units.groups.push_back({input->unitName, {}});
+                    group = std::prev(program.units.groups.end());
+                }
+                group->entries.push_back(c::FunctionId{index(i)});
+            }
         }
         return std::move(program);
     }
