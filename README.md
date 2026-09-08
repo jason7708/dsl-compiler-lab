@@ -275,3 +275,5 @@ CTest 包含獨立 IR verifier 與 backend API 測試，也會執行真實 CLI�
 Clang API 背景可參考官方 [LibTooling 文件](https://clang.llvm.org/docs/LibTooling.html)；本專案實際編譯並驗證的是 20.1.8 標頭。
 
 多種 event 觸發同一份 struct state 的用法、contract 與可執行範例，見 [多 event 入口](docs/multi-event.md)。
+
+Queue、筆數／時間 window 與 CPU／硬體實作分工的規劃，見 [Queue／window 設計方向](docs/queues-and-windows.md)（尚未實作）。

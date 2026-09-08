@@ -2,7 +2,7 @@
 
 記錄日期：2026-09-08。這份文件保存目前的缺陷、限制與建議順序，避免把「已建立架構邊界」誤認為「所有 backend／library 情境都已成熟」。
 
-本輪授權範圍是記錄所有項目，並處理第 1 項。其餘項目是後續待辦。
+最初一輪記錄所有項目並完成第 1 項。後續完成事項與新設計方向記錄於文末；標為待處理／尚未實作的項目仍是待辦。
 
 | 順序 | 項目 | 狀態 |
 | --- | --- | --- |
@@ -159,3 +159,10 @@ Verifier 進入與離開函數、OP、region 時保存／還原位置，OP 錯�
 支援以不同 event 型別多載 `operator()`。每個多載須有一個 event 參數，具名 member function 和自動配對 event 留待後續討論。入口各自有 context／result／error，共用同一份 struct state，成功才提交；成員及 local 計算物件都可用普通 C++ 呼叫語法組合。
 
 核心 IR 維持普通函數，新增分組僅位於 UnitEnvelope.groups。C++ backend 驗證分組後生成多載 function object、按 event 選擇的 contract_set 和 context binder；unit 仍持有固定大小的 state。單入口 API 保持相容。範例與限制見 [multi-event.md](multi-event.md)。
+
+
+## 已記錄、尚未實作：Queue／window library
+
+使用者確認 window 不只包含時間範圍，也包含可固定容量的最近 N 筆；queue／window 應提供不同種類供計算作者選擇。DSL 描述保留策略、運算與精確度，IR 保留語意，CPU 第一階段可以生成使用 `std::deque` 的實體 library 呼叫。硬體未來再提供相容的 queue／window，部署時檢查資源與可行性，不能默默截斷時間視窗。
+
+這次只記錄方向，沒有新增容器語法、IR OP 或 runtime 實作，也沒有決定時間亂序與資源錯誤的處理方式。完整原則、現有 state 提交需要調整之處及驗收建議，見 [queues-and-windows.md](queues-and-windows.md)。
